@@ -1,0 +1,18 @@
+# 敏感配置：含飞书 App Secret、会话密钥，绝不提交
+.env
+
+# 运行时数据
+*.db
+uploads/
+
+# 备份文件
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+
+# 开发工具本地目录
+.claude/
+.gstack/
+.DS_Store
