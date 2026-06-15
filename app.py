@@ -1146,7 +1146,12 @@ def submit_claim(
         raise HTTPException(status_code=400, detail="请选择该部门下的中心/小组")
     if customer_project not in CATALOG[department][team]:
         raise HTTPException(status_code=400, detail="请选择该中心/小组下的项目")
-    actor = actor_from_form(user, name, role, department)
+    # 已登录则认领归到会话身份，不信任表单 user/name（防冒名认领）；未登录走 demo 表单身份
+    session = read_session(request.cookies.get(SESSION_COOKIE, ""))
+    if session:
+        actor = {**actor_from_request(request), "department": department}
+    else:
+        actor = actor_from_form(user, name, role, department)
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
         if not row:
