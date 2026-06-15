@@ -63,9 +63,15 @@ FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_REDIRECT_URI = os.environ.get("FEISHU_REDIRECT_URI", "")
 FEISHU_SCOPE = os.environ.get("FEISHU_SCOPE", "contact:user.base:readonly")
-# 用 open_id 白名单指定哪些人登录后是管理员（财务、总经理、部门负责人等），逗号分隔
-FEISHU_ADMIN_OPEN_IDS = {
-    x.strip() for x in os.environ.get("FEISHU_ADMIN_OPEN_IDS", "").split(",") if x.strip()
+# 超级管理员 open_id 白名单（根权限，逗号分隔）。这一级只能改 .env，
+# 普通管理员由超管在后台勾选、存数据库。兼容旧变量名 FEISHU_ADMIN_OPEN_IDS。
+FEISHU_SUPERADMIN_OPEN_IDS = {
+    x.strip()
+    for x in (
+        os.environ.get("FEISHU_SUPERADMIN_OPEN_IDS")
+        or os.environ.get("FEISHU_ADMIN_OPEN_IDS", "")
+    ).split(",")
+    if x.strip()
 }
 # 给会话 cookie 签名用，必须保密；未设置则随机生成（重启后旧会话失效）
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32)).encode()
@@ -79,6 +85,22 @@ FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 
 def feishu_enabled() -> bool:
     return bool(FEISHU_APP_ID and FEISHU_APP_SECRET and FEISHU_REDIRECT_URI)
+
+
+def db_admin_ids() -> set[str]:
+    """数据库里被超管勾选为管理员的 open_id 集合。"""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT open_id FROM app_users WHERE is_admin = 1").fetchall()
+    return {r["open_id"] for r in rows}
+
+
+def compute_role(open_id: str) -> str:
+    """根据超管白名单 + 数据库管理员表实时判定角色。"""
+    if open_id in FEISHU_SUPERADMIN_OPEN_IDS:
+        return "superadmin"
+    if open_id in db_admin_ids():
+        return "admin"
+    return "claimant"
 
 
 app = FastAPI(title="飞书到款认领系统 MVP")
@@ -167,6 +189,14 @@ def init_db() -> None:
                 department TEXT,
                 team TEXT,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_users (
+                open_id TEXT PRIMARY KEY,
+                name TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_login TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
@@ -356,17 +386,18 @@ def actor_from_request(request: Request) -> dict[str, str]:
         return {
             "id": open_id,
             "name": session.get("name", "飞书用户"),
-            "role": session.get("role", "claimant"),
+            "role": compute_role(open_id),  # 实时判定，超管增减管理员立即生效
             "department": department or "未设置部门",
             "team": team,
             "authed": "1",
         }
+    # 无会话 = 未授权：身份字段仅供 demo 展示，role 一律强制为最低权限 claimant，
+    # 绝不从 query/header 读取角色，杜绝 ?role=admin / x-role 之类的越权。
     params = request.query_params
-    role = params.get("role") or request.headers.get("x-role") or "claimant"
     return {
         "id": params.get("user") or request.headers.get("x-user-id") or "demo-user",
         "name": params.get("name") or request.headers.get("x-user-name") or "演示用户",
-        "role": role,
+        "role": "claimant",
         "department": params.get("department") or request.headers.get("x-department") or "未设置部门",
         "team": params.get("team") or "",
         "authed": "",
@@ -388,8 +419,13 @@ def actor_from_form(
 
 
 def require_admin(actor: dict[str, str]) -> None:
-    if actor["role"] not in {"finance", "admin"}:
+    if actor["role"] not in {"finance", "admin", "superadmin"}:
         raise HTTPException(status_code=403, detail="只有管理员可以访问这个页面")
+
+
+def require_superadmin(actor: dict[str, str]) -> None:
+    if actor["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="只有超级管理员可以管理管理员")
 
 
 def audit(
@@ -561,17 +597,16 @@ def page(
     ident = identity_params(actor)
     search_href = url("/search", **ident) if ident else "/search"
     me_href = url("/me", **ident) if ident else "/me"
-    if actor and actor["role"] in {"finance", "admin"}:
-        admin_href = url("/admin", **ident)
-    else:
-        admin_href = url("/admin", role="admin", user="admin", name="管理员")
+    nav_items = [
+        (search_href, "认领搜索", "search"),
+        (me_href, "个人中心", "me"),
+    ]
+    # 管理后台仅对真实管理员可见；不再用 ?role=admin 给所有人埋后门入口
+    if actor and actor["role"] in {"finance", "admin", "superadmin"}:
+        nav_items.append((url("/admin", **ident), "管理后台", "admin"))
     nav = "".join(
         f'<a href="{esc(href)}" class="{"active" if key == active else ""}">{label}</a>'
-        for href, label, key in [
-            (search_href, "认领搜索", "search"),
-            (me_href, "个人中心", "me"),
-            (admin_href, "管理后台", "admin"),
-        ]
+        for href, label, key in nav_items
     )
     if actor and actor.get("authed"):
         user_area = (
@@ -790,14 +825,23 @@ def feishu_callback(request: Request, code: str = "", state: str = "") -> Redire
     if not open_id:
         raise HTTPException(status_code=400, detail="获取飞书用户信息失败")
     name = info.get("name") or "飞书用户"
-    role = "admin" if open_id in FEISHU_ADMIN_OPEN_IDS else "claimant"
-    session = make_session({"id": open_id, "name": name, "role": role, "src": "feishu"})
+    # 会话只存身份；角色由 compute_role 每次请求实时判定（超管白名单 + 数据库管理员表）
+    session = make_session({"id": open_id, "name": name, "src": "feishu"})
     resp = RedirectResponse(next_url if next_url.startswith("/") else "/search", status_code=302)
     resp.set_cookie(SESSION_COOKIE, session, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_next")
     with get_conn() as conn:
-        audit(conn, {"id": open_id, "name": name, "role": role}, "feishu_login", None, {"name": name}, request)
+        # 记录所有登录过的人，供超管在后台勾选管理员
+        conn.execute(
+            """
+            INSERT INTO app_users (open_id, name, created_at, last_login)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(open_id) DO UPDATE SET name = excluded.name, last_login = excluded.last_login
+            """,
+            (open_id, name, now_text(), now_text()),
+        )
+        audit(conn, {"id": open_id, "name": name, "role": compute_role(open_id)}, "feishu_login", None, {"name": name}, request)
     return resp
 
 
@@ -1173,7 +1217,7 @@ def submit_claim(
     return RedirectResponse(url("/search", user=user, name=name, department=department), status_code=303)
 
 
-ROLE_LABELS = {"claimant": "普通用户", "finance": "管理员", "admin": "管理员"}
+ROLE_LABELS = {"claimant": "普通用户", "finance": "管理员", "admin": "管理员", "superadmin": "超级管理员"}
 
 
 @app.get("/me", response_class=HTMLResponse)
@@ -1332,11 +1376,9 @@ def admin_set_profile(
     open_id: str,
     department: str = Form(...),
     team: str = Form(""),
-    user: str = Form("admin"),
-    name: str = Form("管理员"),
-    role: str = Form("admin"),
 ) -> RedirectResponse:
-    actor = actor_from_form(user, name, role)
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
     require_admin(actor)
     department = require_department(department)
     team = team.strip()
@@ -1350,7 +1392,28 @@ def admin_set_profile(
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="成员不存在")
         audit(conn, actor, "admin_set_profile", None, {"open_id": open_id, "department": department, "team": team}, request)
-    return RedirectResponse(url("/admin", role="admin", user=user, name=name), status_code=303)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/admins/{open_id}")
+def admin_toggle_admin(
+    request: Request,
+    open_id: str,
+    action: str = Form(...),
+) -> RedirectResponse:
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
+    require_superadmin(actor)
+    if open_id in FEISHU_SUPERADMIN_OPEN_IDS:
+        raise HTTPException(status_code=400, detail="超级管理员是根权限，不可更改")
+    with get_conn() as conn:
+        row = conn.execute("SELECT open_id FROM app_users WHERE open_id = ?", (open_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="成员不存在")
+        is_admin = 1 if action == "grant" else 0
+        conn.execute("UPDATE app_users SET is_admin = ? WHERE open_id = ?", (is_admin, open_id))
+        audit(conn, actor, "set_admin", None, {"open_id": open_id, "is_admin": is_admin}, request)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1371,6 +1434,13 @@ def admin_page(request: Request) -> HTMLResponse:
         profiles = conn.execute(
             "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
         ).fetchall()
+        app_user_rows = (
+            conn.execute(
+                "SELECT open_id, name, is_admin, last_login FROM app_users ORDER BY is_admin DESC, last_login DESC"
+            ).fetchall()
+            if actor["role"] == "superadmin"
+            else []
+        )
 
     stat_map = {row["status"]: row for row in stats}
     stat_html = "".join(
@@ -1432,6 +1502,41 @@ def admin_page(request: Request) -> HTMLResponse:
         for p in profiles
     )
 
+    # 管理员管理（仅超级管理员可见）
+    admin_section = ""
+    if actor["role"] == "superadmin":
+        admin_user_rows = "".join(
+            (
+                f"""
+            <tr>
+              <td><strong>{esc(u["name"] or "")}</strong><br><span class="code">{esc(u["open_id"])}</span></td>
+              <td>{'<span class="status closed">超级管理员</span>' if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS else ('<span class="status claimed">管理员</span>' if u["is_admin"] else '<span class="status">普通用户</span>')}</td>
+              <td class="nowrap muted">{esc(u["last_login"] or "")}</td>
+              <td>{
+                  '<span class="muted">根权限，不可更改</span>'
+                  if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS
+                  else f'''<form method="post" action="/admin/admins/{esc(u['open_id'])}">
+                    {finance_hidden(actor)}
+                    <input type="hidden" name="action" value="{'revoke' if u['is_admin'] else 'grant'}">
+                    <button class="{'danger' if u['is_admin'] else ''}" type="submit">{'取消管理员' if u['is_admin'] else '设为管理员'}</button>
+                  </form>'''
+              }</td>
+            </tr>
+            """
+            )
+            for u in app_user_rows
+        )
+        admin_section = f"""
+        <h2>管理员管理</h2>
+        <p class="hint" style="margin:-4px 0 12px">只有你（超级管理员）能看到这里。勾选谁是管理员后，对方刷新页面即生效，无需重新登录、也无需改配置文件。</p>
+        <div class="table-wrap">
+        <table>
+          <thead><tr><th>成员</th><th>当前身份</th><th>最近登录</th><th>操作</th></tr></thead>
+          <tbody>{admin_user_rows or '<tr><td colspan="4" class="empty">还没有人登录过</td></tr>'}</tbody>
+        </table>
+        </div>
+        """
+
     body = f"""
     <div class="grid">{stat_html}</div>
 
@@ -1482,7 +1587,7 @@ def admin_page(request: Request) -> HTMLResponse:
       <tbody>{profile_rows or '<tr><td colspan="3" class="empty">还没有成员设置过部门</td></tr>'}</tbody>
     </table>
     </div>
-
+    {admin_section}
     <h2>最近操作日志</h2>
     <div class="table-wrap">
     <table>
@@ -1580,11 +1685,9 @@ def admin_import(
     source_name: str = Form(...),
     table_text: str = Form(...),
     attachment: Optional[UploadFile] = File(None),
-    user: str = Form("admin"),
-    name: str = Form("管理员"),
-    role: str = Form("admin"),
 ) -> RedirectResponse:
-    actor = actor_from_form(user, name, role)
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
     require_admin(actor)
     source_ref = save_attachment(attachment) or source_name
     rows = read_table(table_text)
@@ -1653,18 +1756,16 @@ def admin_import(
             {"batch_id": batch_id, "raw": len(rows), "imported": imported, "skipped": skipped, "source_ref": source_ref},
             request,
         )
-    return RedirectResponse(url("/admin", role="admin", user=user, name=name), status_code=303)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/batches/{batch_id}/confirm")
 def confirm_batch(
     request: Request,
     batch_id: int,
-    user: str = Form("admin"),
-    name: str = Form("管理员"),
-    role: str = Form("admin"),
 ) -> RedirectResponse:
-    actor = actor_from_form(user, name, role)
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
         rows = conn.execute("SELECT id FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,)).fetchall()
@@ -1674,7 +1775,7 @@ def confirm_batch(
         )
         conn.execute("UPDATE import_batches SET status = 'confirmed' WHERE id = ?", (batch_id,))
         audit(conn, actor, "confirm_batch", None, {"batch_id": batch_id, "count": len(rows)}, request)
-    return RedirectResponse(url("/admin", role="admin", user=user, name=name), status_code=303)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/payments/{payment_id}/edit")
@@ -1685,11 +1786,9 @@ def edit_payment(
     amount: str = Form(""),
     payer_name: str = Form(""),
     bank_note: str = Form(""),
-    user: str = Form("admin"),
-    name: str = Form("管理员"),
-    role: str = Form("admin"),
 ) -> RedirectResponse:
-    actor = actor_from_form(user, name, role)
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
         conn.execute(
@@ -1701,7 +1800,7 @@ def edit_payment(
             (parse_date(received_date), parse_amount(amount), payer_name.strip(), bank_note.strip(), payment_id),
         )
         audit(conn, actor, "edit_payment", payment_id, {"received_date": received_date, "amount": amount}, request)
-    return RedirectResponse(url("/admin", role="admin", user=user, name=name), status_code=303)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/payments/{payment_id}/resolve")
@@ -1712,11 +1811,9 @@ def resolve_payment(
     department: str = Form(""),
     team: str = Form(""),
     finance_note: str = Form(""),
-    user: str = Form("admin"),
-    name: str = Form("管理员"),
-    role: str = Form("admin"),
 ) -> RedirectResponse:
-    actor = actor_from_form(user, name, role)
+    # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    actor = actor_from_request(request)
     require_admin(actor)
     if status not in {"pending", "claimed", "pending_confirm", "rejected", "closed"}:
         raise HTTPException(status_code=400, detail="状态不合法")
@@ -1762,7 +1859,7 @@ def resolve_payment(
                 (status, department, team, finance_note, payment_id),
             )
         audit(conn, actor, "resolve_payment", payment_id, {"status": status, "department": department, "team": team}, request)
-    return RedirectResponse(url("/admin", role="admin", user=user, name=name), status_code=303)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.get("/admin/payments/{payment_id}/logs", response_class=HTMLResponse)
