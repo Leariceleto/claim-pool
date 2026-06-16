@@ -81,6 +81,10 @@ SESSION_MAX_AGE = 7 * 24 * 3600  # 7 天
 FEISHU_AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
 FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
+FEISHU_TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+# 应用对外根地址（用于消息里的查看链接），从回调地址推导
+APP_BASE_URL = os.environ.get("APP_BASE_URL") or FEISHU_REDIRECT_URI.replace("/oauth/callback", "")
 
 
 def feishu_enabled() -> bool:
@@ -365,6 +369,32 @@ def feishu_exchange_token(code: str) -> str:
 def feishu_get_userinfo(user_token: str) -> dict[str, Any]:
     resp = _feishu_request(FEISHU_USERINFO_URL, "GET", bearer=user_token)
     return resp.get("data") or {}
+
+
+def feishu_tenant_token() -> str:
+    resp = _feishu_request(
+        FEISHU_TENANT_TOKEN_URL,
+        "POST",
+        {"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+    )
+    return resp.get("tenant_access_token", "")
+
+
+def feishu_send_text(open_id: str, text: str) -> bool:
+    """以应用身份给用户发飞书单聊文本。容错：失败返回 False，不抛异常。
+    需要权限 im:message:send_as_bot + 应用开启机器人能力。"""
+    if not (feishu_enabled() and open_id):
+        return False
+    token = feishu_tenant_token()
+    if not token:
+        return False
+    resp = _feishu_request(
+        FEISHU_SEND_MSG_URL,
+        "POST",
+        {"receive_id": open_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)},
+        bearer=token,
+    )
+    return resp.get("code") == 0
 
 
 def get_user_profile(open_id: str) -> Optional[sqlite3.Row]:
@@ -1623,6 +1653,21 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
         finance_note = f'<div class="muted">管理备注：{esc(row["finance_note"])}</div>'
     attachment = attachment_link(row["source_ref"] or "", actor)
     source = attachment or esc(row["source_ref"])
+    # 仅对已有人认领的单子（已认领/待确认）显示「驳回退回」
+    reject_ui = ""
+    if row["status"] in {"claimed", "pending_confirm"}:
+        reject_ui = f"""
+        <details class="fold">
+          <summary>驳回退回</summary>
+          <div class="fold-body">
+            <form method="post" action="/admin/payments/{row['id']}/reject">
+              {finance_hidden(actor)}
+              <div class="field"><label>驳回原因（会飞书通知认领人）</label><input name="reason" placeholder="例如：部门归属不对，请重新认领"></div>
+              <button class="danger" type="submit">驳回并退回待认领</button>
+            </form>
+          </div>
+        </details>
+        """
     return f"""
     <tr>
       <td class="nowrap">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
@@ -1665,6 +1710,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
             </form>
           </div>
         </details>
+        {reject_ui}
       </td>
     </tr>
     """
@@ -1864,6 +1910,55 @@ def resolve_payment(
                 (status, department, team, finance_note, payment_id),
             )
         audit(conn, actor, "resolve_payment", payment_id, {"status": status, "department": department, "team": team}, request)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/payments/{payment_id}/reject")
+def reject_payment(
+    request: Request,
+    payment_id: int,
+    reason: str = Form(""),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    reason = reason.strip()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        claimed_by = row["claimed_by"]
+        # 先通知原认领人（飞书单聊），失败不影响退回
+        notified = False
+        if claimed_by:
+            lines = [
+                "【到款认领被驳回】",
+                "你认领的款项已被管理员驳回，已退回认领池，可重新核实认领。",
+                f"付款方：{row['payer_name']}",
+                f"到款日期：{row['received_date']}",
+                f"你填写的：{row['claimed_department'] or ''} / {row['claimed_team'] or ''} · {row['customer_project'] or ''}",
+            ]
+            if reason:
+                lines.append(f"驳回原因：{reason}")
+            if APP_BASE_URL:
+                lines.append(f"重新认领：{APP_BASE_URL}/search")
+            notified = feishu_send_text(claimed_by, "\n".join(lines))
+        # 退回待认领池，清空认领归属，保留驳回原因到管理备注
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'pending',
+                claimed_department = NULL, claimed_team = NULL,
+                claimed_by = NULL, claimed_by_name = NULL, claimed_at = NULL,
+                customer_project = NULL, claim_note = NULL,
+                finance_note = ?
+            WHERE id = ?
+            """,
+            (f"驳回退回：{reason}" if reason else "驳回退回", payment_id),
+        )
+        audit(
+            conn, actor, "reject_payment", payment_id,
+            {"prev_claimed_by": claimed_by, "reason": reason, "notified": notified}, request,
+        )
     return RedirectResponse("/admin", status_code=303)
 
 
