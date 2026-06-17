@@ -20,7 +20,7 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -85,6 +85,15 @@ FEISHU_TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_acces
 FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
 # 应用对外根地址（用于消息里的查看链接），从回调地址推导
 APP_BASE_URL = os.environ.get("APP_BASE_URL") or FEISHU_REDIRECT_URI.replace("/oauth/callback", "")
+
+# OCR 配置：none / tencent。腾讯云 OCR 用于图片型银行回单 PDF。
+OCR_PROVIDER = os.environ.get("OCR_PROVIDER", "none").strip().lower()
+TENCENTCLOUD_SECRET_ID = os.environ.get("TENCENTCLOUD_SECRET_ID", "")
+TENCENTCLOUD_SECRET_KEY = os.environ.get("TENCENTCLOUD_SECRET_KEY", "")
+TENCENTCLOUD_REGION = os.environ.get("TENCENTCLOUD_REGION", "ap-guangzhou")
+TENCENT_OCR_HOST = "ocr.tencentcloudapi.com"
+TENCENT_OCR_SERVICE = "ocr"
+TENCENT_OCR_VERSION = "2018-11-19"
 
 
 def feishu_enabled() -> bool:
@@ -211,6 +220,7 @@ def init_db() -> None:
         )
         ensure_column(conn, "payments", "claimed_team", "claimed_team TEXT")
         ensure_column(conn, "claims", "team", "team TEXT")
+        ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -253,6 +263,10 @@ def parse_date(value: Any) -> str:
     if not text:
         return ""
     text = text.replace("/", "-").replace(".", "-")
+    match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if match:
+        y, m, d = match.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
     match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
     if match:
         y, m, d = match.groups()
@@ -567,6 +581,7 @@ BASE_CSS = """
     .status::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; flex:none; }
     .status.draft { background:#e8edf5; color:#3b5275; }
     .status.pending { background:#fdf2d9; color:#9a6700; }
+    .status.partial_claiming { background:#e9effc; color:#2456d6; }
     .status.claimed { background:#dcf5e7; color:#13794c; }
     .status.pending_confirm { background:#fdeaec; color:#b4232e; }
     .status.rejected { background:#efeff2; color:#6b7280; }
@@ -728,6 +743,232 @@ def read_table(text: str) -> list[dict[str, str]]:
     return result
 
 
+def extract_pdf_text(path: Path) -> str:
+    """读取可复制文本 PDF；图片型/扫描件通常会返回空文本。"""
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"缺少 PDF 解析依赖 pypdf：{exc}") from exc
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"PDF 文件无法读取：{exc}") from exc
+
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages).strip()
+
+
+def first_match(text: str, patterns: list[str]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def parse_pdf_receipts(text: str) -> list[dict[str, str]]:
+    """从银行入账回单文本里抽取流水。第一版偏保守，抽不到关键字段就不入库。"""
+    normalized = re.sub(r"[ \t]+", " ", text.replace("\r", "\n"))
+    blocks = [b.strip() for b in re.split(r"入\s*账\s*回\s*单", normalized) if b.strip()]
+    if not blocks:
+        blocks = [normalized]
+
+    rows = []
+    for block in blocks:
+        received_date = first_match(block, [r"交易日期[:：]\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2})"])
+        received_time = first_match(block, [r"交易时间[:：]\s*([0-9]{1,2}[:：][0-9]{2}(?::[0-9]{2})?)"])
+        payer_name = first_match(block, [r"付款账户户名[:：]\s*([^\n]+)", r"付款人[:：]\s*([^\n]+)"])
+        receiver_account = first_match(block, [r"收款账号[:：]\s*([0-9A-Za-z* ]+)", r"收款账户[:：]\s*([0-9A-Za-z* ]+)"])
+        serial_no = first_match(block, [r"业务编号[:：]\s*([0-9A-Za-z]+)", r"回单编号[:：]\s*([0-9A-Za-z]+)", r"流水号[:：]\s*([0-9A-Za-z]+)"])
+        amount = first_match(
+            block,
+            [
+                r"交易金额[（(]小写[)）]?[:：]\s*(?:人民币|CNY|￥|¥)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+                r"交易金额[:：]\s*(?:人民币|CNY|￥|¥)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+                r"金额[:：]\s*(?:人民币|CNY|￥|¥)?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+            ],
+        )
+        bank_note = first_match(block, [r"(?:附言|摘要|用途|交易摘要)[:：]\s*([^\n]+)"])
+
+        if received_date and payer_name and parse_amount(amount) > 0:
+            rows.append(
+                {
+                    "received_date": received_date,
+                    "received_time": received_time,
+                    "payer_name": payer_name,
+                    "amount": amount,
+                    "bank_note": bank_note,
+                    "receiver_account": receiver_account,
+                    "serial_no": serial_no,
+                }
+            )
+    return rows
+
+
+def tencent_sign(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def tencent_cloud_request(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not (TENCENTCLOUD_SECRET_ID and TENCENTCLOUD_SECRET_KEY):
+        raise HTTPException(status_code=500, detail="未配置腾讯云 OCR 密钥：TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY")
+
+    timestamp = int(time.time())
+    date = datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    hashed_payload = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    canonical_headers = (
+        "content-type:application/json; charset=utf-8\n"
+        f"host:{TENCENT_OCR_HOST}\n"
+        f"x-tc-action:{action.lower()}\n"
+    )
+    signed_headers = "content-type;host;x-tc-action"
+    canonical_request = "\n".join(
+        ["POST", "/", "", canonical_headers, signed_headers, hashed_payload]
+    )
+    credential_scope = f"{date}/{TENCENT_OCR_SERVICE}/tc3_request"
+    string_to_sign = "\n".join(
+        [
+            "TC3-HMAC-SHA256",
+            str(timestamp),
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+    secret_date = tencent_sign(("TC3" + TENCENTCLOUD_SECRET_KEY).encode("utf-8"), date)
+    secret_service = tencent_sign(secret_date, TENCENT_OCR_SERVICE)
+    secret_signing = tencent_sign(secret_service, "tc3_request")
+    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        "TC3-HMAC-SHA256 "
+        f"Credential={TENCENTCLOUD_SECRET_ID}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers = {
+        "Authorization": authorization,
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": TENCENT_OCR_HOST,
+        "X-TC-Action": action,
+        "X-TC-Version": TENCENT_OCR_VERSION,
+        "X-TC-Timestamp": str(timestamp),
+        "X-TC-Region": TENCENTCLOUD_REGION,
+    }
+    req = urllib.request.Request(
+        f"https://{TENCENT_OCR_HOST}",
+        data=body.encode("utf-8"),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=502, detail=f"腾讯云 OCR 请求失败：HTTP {exc.code}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"腾讯云 OCR 网络请求失败：{exc}") from exc
+
+    response = data.get("Response") or {}
+    if response.get("Error"):
+        error = response["Error"]
+        raise HTTPException(
+            status_code=502,
+            detail=f"腾讯云 OCR 识别失败：{error.get('Code', '')} {error.get('Message', '')}",
+        )
+    return response
+
+
+def bank_slip_value(info_map: dict[str, str], contains: list[str]) -> str:
+    for key, value in info_map.items():
+        if any(word in key for word in contains) and value:
+            return value.strip()
+    return ""
+
+
+def bank_slip_infos_to_row(infos: list[dict[str, Any]]) -> dict[str, str]:
+    info_map = {
+        str(item.get("Name", "")).strip(): str(item.get("Value", "")).strip()
+        for item in infos
+        if str(item.get("Name", "")).strip()
+    }
+    received_date = bank_slip_value(info_map, ["交易日期", "入账日期", "日期"])
+    received_time = bank_slip_value(info_map, ["交易时间", "时间"])
+    payer_name = bank_slip_value(
+        info_map,
+        ["付款账户户名", "付款户名", "付款方户名", "付款人户名", "付款人", "付款方"],
+    )
+    amount = bank_slip_value(info_map, ["交易金额", "金额小写", "金额"])
+    bank_note = bank_slip_value(info_map, ["附言", "摘要", "用途", "备注"])
+    receiver_account = bank_slip_value(info_map, ["收款账号", "收款账户", "收款人账号"])
+    serial_no = bank_slip_value(info_map, ["流水号", "回单编号", "业务编号", "凭证号码"])
+    return {
+        "received_date": received_date,
+        "received_time": received_time,
+        "payer_name": payer_name,
+        "amount": amount,
+        "bank_note": bank_note,
+        "receiver_account": receiver_account,
+        "serial_no": serial_no,
+    }
+
+
+def ocr_pdf_with_tencent(path: Path) -> tuple[list[dict[str, str]], str]:
+    raw = path.read_bytes()
+    if len(base64.b64encode(raw)) > 7 * 1024 * 1024:
+        return [], "PDF 超过腾讯云 OCR ImageBase64 7MB 限制，请拆分或压缩后再上传。"
+
+    try:
+        from pypdf import PdfReader
+        page_count = len(PdfReader(str(path)).pages)
+    except Exception:
+        page_count = 1
+
+    image_base64 = base64.b64encode(raw).decode("ascii")
+    rows = []
+    errors = []
+    for page_no in range(1, max(page_count, 1) + 1):
+        try:
+            response = tencent_cloud_request(
+                "BankSlipOCR",
+                {"ImageBase64": image_base64, "IsPdf": True, "PdfPageNumber": page_no},
+            )
+        except HTTPException as exc:
+            errors.append(str(exc.detail))
+            continue
+        infos = response.get("BankSlipInfos") or []
+        row = bank_slip_infos_to_row(infos)
+        if row.get("received_date") and row.get("payer_name") and parse_amount(row.get("amount")) > 0:
+            rows.append(row)
+        elif infos:
+            errors.append(f"第 {page_no} 页已识别文字，但缺少日期/付款方/金额等关键字段")
+        else:
+            errors.append(f"第 {page_no} 页未识别到银行回单字段")
+
+    if rows:
+        return rows, ""
+    return [], "腾讯云 OCR 未识别到完整银行回单流水。" + ("；".join(errors[:3]) if errors else "")
+
+
+def rows_from_pdf(path: Path) -> tuple[list[dict[str, str]], str]:
+    text = extract_pdf_text(path)
+    if text:
+        rows = parse_pdf_receipts(text)
+        if rows:
+            return rows, ""
+        if OCR_PROVIDER != "tencent":
+            return [], "PDF 文本已读取，但未识别到完整流水字段。请粘贴表格文本，至少包含到款日期、付款方名称、到款金额。"
+
+    if OCR_PROVIDER == "tencent":
+        return ocr_pdf_with_tencent(path)
+    return [], "PDF 未识别到可复制文本，可能是图片型/扫描件。请配置腾讯云 OCR，或先 OCR 后粘贴表格文本。"
+
+
+
 def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str], amount_cents: int) -> bool:
     serial_no = item.get("serial_no", "").strip()
     if serial_no:
@@ -757,6 +998,7 @@ def status_badge(status: str) -> str:
     labels = {
         "draft": "待确认入池",
         "pending": "待认领",
+        "partial_claiming": "部分认领中",
         "claimed": "已认领",
         "pending_confirm": "待确认",
         "rejected": "已驳回",
@@ -933,6 +1175,35 @@ def catalog_script() -> str:
     )
 
 
+def claim_totals(conn: sqlite3.Connection, payment_id: int) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status IN ('pending', 'accepted') THEN amount_cents ELSE 0 END), 0) AS active,
+            COALESCE(SUM(CASE WHEN status = 'accepted' THEN amount_cents ELSE 0 END), 0) AS accepted,
+            COALESCE(SUM(CASE WHEN status = 'pending' THEN amount_cents ELSE 0 END), 0) AS pending
+        FROM claims
+        WHERE payment_id = ?
+        """,
+        (payment_id,),
+    ).fetchone()
+    return {"active": row["active"], "accepted": row["accepted"], "pending": row["pending"]}
+
+
+def claim_summary_html(conn: sqlite3.Connection, row: sqlite3.Row, show_amount: bool = True) -> str:
+    totals = claim_totals(conn, row["id"])
+    if totals["active"] <= 0:
+        return ""
+    remaining = max((row["amount_cents"] or 0) - totals["active"], 0)
+    if not show_amount:
+        return '<div class="muted">已有部分认领，待财务确认</div>'
+    return (
+        f'<div class="muted">已提交 ¥ {money(totals["active"])}'
+        f' · 待确认 ¥ {money(totals["pending"])}'
+        f' · 剩余 ¥ {money(remaining)}</div>'
+    )
+
+
 def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
     my_dept = actor.get("department") if actor.get("department") in DEPARTMENTS else ""
     my_team = actor.get("team", "")
@@ -950,6 +1221,7 @@ def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
           <div class="field"><label>认领部门</label><select name="department" class="cs-dept" required>{dept_options}</select></div>
           <div class="field"><label>中心 / 小组</label>{team_select("team", my_dept, my_team, required=True)}</div>
           <div class="field"><label>项目</label>{project_select("customer_project", my_dept, my_team, required=True)}</div>
+          <div class="field"><label>认领金额</label><input name="claim_amount" placeholder="留空表示整笔/部分认领请填写金额"></div>
           <div class="field"><label>备注说明</label><input name="note" placeholder="可选"></div>
           <button type="submit">提交认领</button>
         </form>
@@ -983,22 +1255,25 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         result_html = '<div class="callout info">没有找到匹配记录。请换一个更具体的客户名、金额或备注关键词。</div>'
     elif results:
         rows = []
-        for row in results:
-            claim_hint = ""
-            if row["status"] in {"claimed", "pending_confirm"}:
-                claim_hint = f'<div class="muted">{esc(row["claimed_department"] or "")} · {esc(row["claimed_by_name"] or "")}</div>'
-            rows.append(
-                f"""
-                <tr>
-                  <td class="nowrap">{esc(row["received_date"])}</td>
-                  <td class="num">¥ {money(row["amount_cents"])}</td>
-                  <td><strong>{esc(row["payer_name"])}</strong></td>
-                  <td>{esc(row["bank_note"])}</td>
-                  <td>{status_badge(row["status"])}{claim_hint}</td>
-                  <td class="actions">{claim_form_html(row, actor)}</td>
-                </tr>
-                """
-            )
+        with get_conn() as conn:
+            for row in results:
+                claim_hint = ""
+                if row["status"] in {"claimed", "pending_confirm"}:
+                    claim_hint = f'<div class="muted">{esc(row["claimed_department"] or "")} · {esc(row["claimed_by_name"] or "")}</div>'
+                elif row["status"] == "partial_claiming":
+                    claim_hint = claim_summary_html(conn, row)
+                rows.append(
+                    f"""
+                    <tr>
+                      <td class="nowrap">{esc(row["received_date"])}</td>
+                      <td class="num">¥ {money(row["amount_cents"])}</td>
+                      <td><strong>{esc(row["payer_name"])}</strong></td>
+                      <td>{esc(row["bank_note"])}</td>
+                      <td>{status_badge(row["status"])}{claim_hint}</td>
+                      <td class="actions">{claim_form_html(row, actor)}</td>
+                    </tr>
+                    """
+                )
         result_html = f"""
         <div class="table-wrap">
         <table>
@@ -1048,18 +1323,19 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
     """
 
     if pending_rows:
-        rows = [
-            f"""
-            <tr>
-              <td class="nowrap">{esc(row["received_date"])}</td>
-              <td><strong>{esc(row["payer_name"])}</strong></td>
-              <td>{esc(row["bank_note"])}</td>
-              <td>{status_badge(row["status"])}</td>
-              <td class="actions">{claim_form_html(row, actor)}</td>
-            </tr>
-            """
-            for row in pending_rows
-        ]
+        with get_conn() as conn:
+            rows = [
+                f"""
+                <tr>
+                  <td class="nowrap">{esc(row["received_date"])}</td>
+                  <td><strong>{esc(row["payer_name"])}</strong></td>
+                  <td>{esc(row["bank_note"])}</td>
+                  <td>{status_badge(row["status"])}{claim_summary_html(conn, row, show_amount=False)}</td>
+                  <td class="actions">{claim_form_html(row, actor)}</td>
+                </tr>
+                """
+                for row in pending_rows
+            ]
         table_html = f"""
         <div class="table-wrap">
         <table>
@@ -1147,7 +1423,7 @@ def run_search(conn: sqlite3.Connection, q: str) -> list[sqlite3.Row]:
         f"""
         SELECT *
         FROM payments
-        WHERE status IN ('pending', 'claimed', 'pending_confirm')
+        WHERE status IN ('pending', 'partial_claiming', 'claimed', 'pending_confirm')
           AND {where}
         ORDER BY received_date DESC, id DESC
         LIMIT {SEARCH_LIMIT}
@@ -1167,6 +1443,7 @@ def submit_claim(
     team: str = Form(""),
     customer_project: str = Form(...),
     contract_invoice: str = Form(""),
+    claim_amount: str = Form(""),
     note: str = Form(""),
 ) -> RedirectResponse:
     department = require_department(department)
@@ -1186,23 +1463,42 @@ def submit_claim(
         row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="记录不存在")
-        if row["status"] not in {"pending", "claimed", "pending_confirm"}:
+        if row["status"] not in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
             raise HTTPException(status_code=409, detail="这笔款当前状态不能认领")
 
+        totals = claim_totals(conn, payment_id)
+        remaining_amount = max(row["amount_cents"] - totals["active"], 0)
+        requested_amount = parse_amount(claim_amount)
+        if requested_amount <= 0:
+            requested_amount = remaining_amount if totals["active"] > 0 else row["amount_cents"]
+        if requested_amount <= 0:
+            raise HTTPException(status_code=400, detail="认领金额必须大于 0")
+        if requested_amount > row["amount_cents"]:
+            raise HTTPException(status_code=400, detail="认领金额不能超过到款金额")
+
+        if totals["active"] + requested_amount > row["amount_cents"]:
+            raise HTTPException(status_code=409, detail="认领金额超过该笔款剩余可认领金额")
+
+        full_single_claim = (
+            row["status"] == "pending"
+            and totals["active"] == 0
+            and requested_amount == row["amount_cents"]
+        )
         conflict = row["status"] in {"claimed", "pending_confirm"} and (
             (row["claimed_department"] or "") != department or (row["claimed_by"] or "") != actor["id"]
         )
-        claim_status = "pending" if conflict else "accepted"
+        claim_status = "accepted" if full_single_claim and not conflict else "pending"
         conn.execute(
             """
             INSERT INTO claims
-                (payment_id, department, team, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment_id,
                 department,
                 team.strip(),
+                requested_amount,
                 actor["id"],
                 actor["name"],
                 customer_project,
@@ -1213,12 +1509,14 @@ def submit_claim(
             ),
         )
 
-        if conflict:
+        if not full_single_claim or conflict:
+            next_total = totals["active"] + requested_amount
+            next_status = "pending_confirm" if next_total >= row["amount_cents"] else "partial_claiming"
             conn.execute(
-                "UPDATE payments SET status = 'pending_confirm', finance_note = ? WHERE id = ?",
-                ("存在多次认领，需要管理员确认", payment_id),
+                "UPDATE payments SET status = ?, finance_note = ? WHERE id = ?",
+                (next_status, "存在部分认领，需要管理员确认分摊", payment_id),
             )
-            action = "claim_conflict"
+            action = "claim_partial_submit"
         else:
             conn.execute(
                 """
@@ -1247,7 +1545,19 @@ def submit_claim(
                 ),
             )
             action = "claim_submit"
-        audit(conn, actor, action, payment_id, {"department": department, "team": team.strip(), "customer_project": customer_project}, request)
+        audit(
+            conn,
+            actor,
+            action,
+            payment_id,
+            {
+                "department": department,
+                "team": team.strip(),
+                "customer_project": customer_project,
+                "amount_cents": requested_amount,
+            },
+            request,
+        )
 
     return RedirectResponse(url("/search", user=user, name=name, department=department), status_code=303)
 
@@ -1262,7 +1572,8 @@ def personal_center(request: Request) -> HTMLResponse:
         my_claims = conn.execute(
             """
             SELECT c.id AS c_id, c.department AS c_dept, c.team AS c_team,
-                   c.customer_project AS c_proj, c.created_at AS c_at, c.status AS c_status,
+                   c.customer_project AS c_proj, c.amount_cents AS c_amount,
+                   c.created_at AS c_at, c.status AS c_status,
                    p.received_date, p.payer_name, p.bank_note, p.status AS p_status,
                    p.claimed_by, p.claimed_by_name
             FROM claims c
@@ -1273,8 +1584,8 @@ def personal_center(request: Request) -> HTMLResponse:
             """,
             (actor["id"],),
         ).fetchall()
-        accepted = sum(1 for r in my_claims if r["p_status"] == "claimed" and r["claimed_by"] == actor["id"])
-        waiting = sum(1 for r in my_claims if r["p_status"] == "pending_confirm")
+        accepted = sum(1 for r in my_claims if r["c_status"] == "accepted")
+        waiting = sum(1 for r in my_claims if r["c_status"] == "pending")
 
     role_label = ROLE_LABELS.get(actor["role"], actor["role"])
     initial = esc(actor["name"][:1]) if actor["name"] else "我"
@@ -1334,10 +1645,12 @@ def personal_center(request: Request) -> HTMLResponse:
     if my_claims:
         rows = []
         for r in my_claims:
-            if r["p_status"] == "claimed" and r["claimed_by"] == actor["id"]:
-                state = status_badge("claimed")
-            elif r["p_status"] == "pending_confirm":
+            if r["c_status"] == "accepted":
+                state = '<span class="status claimed">已确认</span>'
+            elif r["c_status"] == "pending":
                 state = status_badge("pending_confirm")
+            elif r["c_status"] == "rejected":
+                state = status_badge("rejected")
             elif r["p_status"] == "rejected":
                 state = status_badge("rejected")
             elif r["claimed_by"] and r["claimed_by"] != actor["id"]:
@@ -1349,7 +1662,7 @@ def personal_center(request: Request) -> HTMLResponse:
                 <tr>
                   <td class="nowrap">{esc(r["received_date"])}</td>
                   <td><strong>{esc(r["payer_name"])}</strong><div class="muted">{esc(r["bank_note"])}</div></td>
-                  <td>{esc(r["c_dept"])}<div class="muted">{esc(r["c_team"])} · {esc(r["c_proj"])}</div></td>
+                  <td>{esc(r["c_dept"])}<div class="muted">{esc(r["c_team"])} · {esc(r["c_proj"])} · ¥ {money(r["c_amount"])}</div></td>
                   <td class="nowrap muted">{esc(r["c_at"])}</td>
                   <td>{state}</td>
                 </tr>
@@ -1451,6 +1764,124 @@ def admin_toggle_admin(
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.get("/admin/export/today")
+def export_today_payments(request: Request) -> Response:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, received_date, received_time, payer_name, amount_cents, bank_note,
+                   receiver_account, serial_no, status, claimed_department, claimed_team,
+                   customer_project, claimed_by_name, claimed_at, claim_note, finance_note,
+                   source_ref, imported_at, confirmed_at
+            FROM payments
+            WHERE received_date = ?
+            ORDER BY id DESC
+            """,
+            (today,),
+        ).fetchall()
+        audit(conn, actor, "export_today_payments", None, {"date": today, "count": len(rows)}, request)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "ID",
+            "认领记录ID",
+            "到款日期",
+            "到款时间",
+            "付款方",
+            "到款金额",
+            "认领金额",
+            "银行备注",
+            "收款账户",
+            "流水号",
+            "状态",
+            "认领状态",
+            "认领部门",
+            "中心/小组",
+            "项目",
+            "认领人",
+            "认领时间",
+            "认领备注",
+            "管理备注",
+            "来源/凭证",
+            "导入时间",
+            "确认入池时间",
+        ]
+    )
+    for row in rows:
+        with get_conn() as conn:
+            claim_rows = conn.execute(
+                "SELECT * FROM claims WHERE payment_id = ? ORDER BY id",
+                (row["id"],),
+            ).fetchall()
+        if not claim_rows:
+            claim_rows = [None]
+        for claim in claim_rows:
+            writer.writerow(
+                [
+                    row["id"],
+                    claim["id"] if claim else "",
+                    row["received_date"],
+                    row["received_time"],
+                    row["payer_name"],
+                    money(row["amount_cents"]),
+                    money(claim["amount_cents"]) if claim else "",
+                    row["bank_note"],
+                    row["receiver_account"],
+                    row["serial_no"],
+                    row["status"],
+                    claim["status"] if claim else "",
+                    claim["department"] if claim else row["claimed_department"],
+                    claim["team"] if claim else row["claimed_team"],
+                    claim["customer_project"] if claim else row["customer_project"],
+                    claim["actor_name"] if claim else row["claimed_by_name"],
+                    claim["created_at"] if claim else row["claimed_at"],
+                    claim["note"] if claim else row["claim_note"],
+                    row["finance_note"],
+                    row["source_ref"],
+                    row["imported_at"],
+                    row["confirmed_at"],
+                ]
+            )
+    filename = f"claim_pool_today_{today}.csv"
+    return Response(
+        "\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def batch_status_badge(status: str) -> str:
+    labels = {
+        "draft": ("待确认", "draft"),
+        "confirmed": ("已入池", "claimed"),
+        "canceled": ("已取消", "rejected"),
+    }
+    label, css = labels.get(status, (status, ""))
+    return f'<span class="status {esc(css)}">{esc(label)}</span>'
+
+
+def render_batch_actions(row: sqlite3.Row, actor: dict[str, str]) -> str:
+    if row["status"] != "draft":
+        return '<span class="muted">无需操作</span>'
+    return f"""
+    <div class="row" style="gap:8px; align-items:center">
+      <form method="post" action="/admin/batches/{row['id']}/confirm">
+        {finance_hidden(actor)}
+        <button type="submit">确认入池</button>
+      </form>
+      <form method="post" action="/admin/batches/{row['id']}/cancel" onsubmit="return confirm('确定取消这个导入批次吗？待确认流水会被移除。')">
+        {finance_hidden(actor)}
+        <button class="danger" type="submit">取消</button>
+      </form>
+    </div>
+    """
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request) -> HTMLResponse:
     actor = actor_from_request(request)
@@ -1487,6 +1918,7 @@ def admin_page(request: Request) -> HTMLResponse:
         for status, label, dot in [
             ("draft", "待确认", "#64748b"),
             ("pending", "待认领", "#d97706"),
+            ("partial_claiming", "部分认领中", "#2456d6"),
             ("claimed", "已认领", "#16a34a"),
             ("pending_confirm", "待确认异常", "#dc2626"),
             ("rejected", "已驳回", "#94a3b8"),
@@ -1501,14 +1933,8 @@ def admin_page(request: Request) -> HTMLResponse:
           <td>{esc(row['source_name'])}</td>
           <td class="nowrap">{esc(row['created_at'])}</td>
           <td class="nowrap">{esc(row['raw_count'])} / {esc(row['imported_count'])} / {esc(row['skipped_count'])}</td>
-          <td>{'<span class="status claimed">已入池</span>' if row['status'] == 'confirmed' else '<span class="status draft">待确认</span>'}</td>
-          <td>
-            {'<span class="muted">无需操作</span>' if row['status'] == 'confirmed' else f'''
-            <form method="post" action="/admin/batches/{row['id']}/confirm">
-              {finance_hidden(actor)}
-              <button type="submit">确认入池</button>
-            </form>'''}
-          </td>
+          <td>{batch_status_badge(row['status'])}</td>
+          <td>{render_batch_actions(row, actor)}</td>
         </tr>
         """
         for row in batches
@@ -1574,6 +2000,16 @@ def admin_page(request: Request) -> HTMLResponse:
 
     body = f"""
     <div class="grid">{stat_html}</div>
+
+    <div class="panel">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:600">当日数据导出</div>
+          <p class="hint" style="margin:4px 0 0">按到款日期导出今天的全部流水，CSV 可直接用 Excel 打开。</p>
+        </div>
+        <a class="login-btn" href="/admin/export/today">下载今日 CSV</a>
+      </div>
+    </div>
 
     <h2>导入流水</h2>
     <div class="panel">
@@ -1644,10 +2080,23 @@ def finance_hidden(actor: dict[str, str]) -> str:
 
 
 def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
+    with get_conn() as conn:
+        claim_rows = conn.execute(
+            "SELECT * FROM claims WHERE payment_id = ? ORDER BY id DESC",
+            (row["id"],),
+        ).fetchall()
+        totals = claim_totals(conn, row["id"])
     claimed = ""
     if row["claimed_department"] or row["claimed_by_name"]:
         parts = [part for part in (row["claimed_department"], row["claimed_team"], row["claimed_by_name"]) if part]
         claimed = f'<div class="muted">{esc(" · ".join(parts))}<br>{esc(row["customer_project"])}</div>'
+    if totals["active"] > 0:
+        claimed += (
+            f'<div class="muted">认领合计 ¥ {money(totals["active"])}'
+            f' · 已确认 ¥ {money(totals["accepted"])}'
+            f' · 待确认 ¥ {money(totals["pending"])}'
+            f' · 剩余 ¥ {money(max((row["amount_cents"] or 0) - totals["active"], 0))}</div>'
+        )
     finance_note = ""
     if row["finance_note"]:
         finance_note = f'<div class="muted">管理备注：{esc(row["finance_note"])}</div>'
@@ -1710,15 +2159,59 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
             </form>
           </div>
         </details>
+        {render_claim_review_html(claim_rows, actor)}
         {reject_ui}
       </td>
     </tr>
     """
 
 
+def render_claim_review_html(claim_rows: list[sqlite3.Row], actor: dict[str, str]) -> str:
+    if not claim_rows:
+        return ""
+    rows = []
+    for claim in claim_rows:
+        status = {"pending": "待确认", "accepted": "已确认", "rejected": "已驳回"}.get(claim["status"], claim["status"])
+        actions = '<span class="muted">无需操作</span>'
+        if claim["status"] == "pending":
+            actions = f"""
+            <form method="post" action="/admin/claims/{claim['id']}/accept" style="display:inline">
+              {finance_hidden(actor)}
+              <button class="secondary" type="submit">确认</button>
+            </form>
+            <form method="post" action="/admin/claims/{claim['id']}/reject" style="display:inline; margin-left:6px">
+              {finance_hidden(actor)}
+              <button class="danger" type="submit">驳回</button>
+            </form>
+            """
+        rows.append(
+            f"""
+            <tr>
+              <td>{esc(claim["department"])}<div class="muted">{esc(claim["team"])} · {esc(claim["customer_project"])}</div></td>
+              <td class="num">¥ {money(claim["amount_cents"])}</td>
+              <td>{esc(claim["actor_name"])}<div class="muted">{esc(claim["created_at"])}</div></td>
+              <td>{esc(status)}</td>
+              <td>{actions}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <details class="fold">
+      <summary>认领明细</summary>
+      <div class="fold-body">
+        <table>
+          <thead><tr><th>部门 / 项目</th><th>金额</th><th>认领人</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </details>
+    """
+
+
 def status_options(current: str) -> str:
     items = [
         ("pending", "待认领"),
+        ("partial_claiming", "部分认领中"),
         ("claimed", "已认领"),
         ("pending_confirm", "待确认"),
         ("rejected", "已驳回"),
@@ -1742,6 +2235,12 @@ def admin_import(
     require_admin(actor)
     source_ref = save_attachment(attachment) or source_name
     rows = read_table(table_text)
+    if not rows and source_ref.startswith("uploads/") and Path(source_ref).suffix.lower() == ".pdf":
+        rows, reason = rows_from_pdf(UPLOAD_DIR / Path(source_ref).name)
+        if not rows:
+            raise HTTPException(status_code=400, detail=reason)
+    if not rows:
+        raise HTTPException(status_code=400, detail="未识别到任何流水。请粘贴 CSV / TSV / 表格文本，或上传可复制文本 PDF。")
     with get_conn() as conn:
         cur = conn.execute(
             """
@@ -1829,6 +2328,156 @@ def confirm_batch(
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.post("/admin/batches/{batch_id}/cancel")
+def cancel_batch(
+    request: Request,
+    batch_id: int,
+) -> RedirectResponse:
+    # 敏感操作：仅允许取消尚未确认入池的 draft 批次，避免误删已开放认领的数据
+    actor = actor_from_request(request)
+    require_admin(actor)
+    with get_conn() as conn:
+        batch = conn.execute("SELECT * FROM import_batches WHERE id = ?", (batch_id,)).fetchone()
+        if not batch:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        if batch["status"] != "draft":
+            raise HTTPException(status_code=409, detail="只有待确认批次可以取消")
+        locked = conn.execute(
+            "SELECT COUNT(*) AS count FROM payments WHERE batch_id = ? AND status != 'draft'",
+            (batch_id,),
+        ).fetchone()["count"]
+        if locked:
+            raise HTTPException(status_code=409, detail="该批次已有非待确认流水，不能取消")
+        rows = conn.execute("SELECT id FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,)).fetchall()
+        conn.execute("DELETE FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,))
+        conn.execute("UPDATE import_batches SET status = 'canceled' WHERE id = ?", (batch_id,))
+        audit(conn, actor, "cancel_batch", None, {"batch_id": batch_id, "count": len(rows)}, request)
+    return RedirectResponse("/admin", status_code=303)
+
+
+def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> None:
+    row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    if not row:
+        return
+    totals = claim_totals(conn, payment_id)
+    if totals["active"] <= 0:
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'pending',
+                claimed_department = NULL,
+                claimed_team = NULL,
+                claimed_by = NULL,
+                claimed_by_name = NULL,
+                claimed_at = NULL,
+                customer_project = NULL,
+                claim_note = NULL,
+                finance_note = NULL
+            WHERE id = ?
+            """,
+            (payment_id,),
+        )
+    elif totals["accepted"] >= row["amount_cents"] and totals["pending"] == 0:
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'claimed',
+                claimed_department = '多部门分摊',
+                claimed_team = NULL,
+                claimed_by = NULL,
+                claimed_by_name = '财务确认',
+                claimed_at = ?,
+                customer_project = NULL,
+                claim_note = NULL,
+                finance_note = '部分认领已确认完成'
+            WHERE id = ?
+            """,
+            (now_text(), payment_id),
+        )
+    elif totals["active"] >= row["amount_cents"]:
+        conn.execute(
+            "UPDATE payments SET status = 'pending_confirm', finance_note = ? WHERE id = ?",
+            ("部分认领金额已覆盖整笔到款，待管理员确认", payment_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE payments SET status = 'partial_claiming', finance_note = ? WHERE id = ?",
+            ("存在部分认领，需要管理员确认分摊", payment_id),
+        )
+
+
+@app.post("/admin/claims/{claim_id}/accept")
+def accept_claim(
+    request: Request,
+    claim_id: int,
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    with get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(status_code=404, detail="认领记录不存在")
+        if claim["status"] != "pending":
+            raise HTTPException(status_code=409, detail="只有待确认认领可以确认")
+        payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
+        if not payment:
+            raise HTTPException(status_code=404, detail="到款记录不存在")
+        accepted = claim_totals(conn, claim["payment_id"])["accepted"]
+        if accepted + claim["amount_cents"] > payment["amount_cents"]:
+            raise HTTPException(status_code=409, detail="确认后金额会超过到款金额")
+        conn.execute("UPDATE claims SET status = 'accepted' WHERE id = ?", (claim_id,))
+        refresh_payment_claim_status(conn, claim["payment_id"])
+        audit(
+            conn,
+            actor,
+            "accept_claim",
+            claim["payment_id"],
+            {"claim_id": claim_id, "amount_cents": claim["amount_cents"]},
+            request,
+        )
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/claims/{claim_id}/reject")
+def reject_claim(
+    request: Request,
+    claim_id: int,
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    with get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(status_code=404, detail="认领记录不存在")
+        if claim["status"] != "pending":
+            raise HTTPException(status_code=409, detail="只有待确认认领可以驳回")
+        payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
+        notified = False
+        if payment:
+            lines = [
+                "【部分到款认领被驳回】",
+                "你提交的部分金额认领已被管理员驳回，可重新核实后再提交。",
+                f"付款方：{payment['payer_name']}",
+                f"到款日期：{payment['received_date']}",
+                f"认领金额：¥ {money(claim['amount_cents'])}",
+                f"你填写的：{claim['department']} / {claim['team']} · {claim['customer_project']}",
+            ]
+            if APP_BASE_URL:
+                lines.append(f"重新认领：{APP_BASE_URL}/search")
+            notified = feishu_send_text(claim["actor_id"], "\n".join(lines))
+        conn.execute("UPDATE claims SET status = 'rejected' WHERE id = ?", (claim_id,))
+        refresh_payment_claim_status(conn, claim["payment_id"])
+        audit(
+            conn,
+            actor,
+            "reject_claim",
+            claim["payment_id"],
+            {"claim_id": claim_id, "amount_cents": claim["amount_cents"], "notified": notified},
+            request,
+        )
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/payments/{payment_id}/edit")
 def edit_payment(
     request: Request,
@@ -1866,7 +2515,7 @@ def resolve_payment(
     # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
     actor = actor_from_request(request)
     require_admin(actor)
-    if status not in {"pending", "claimed", "pending_confirm", "rejected", "closed"}:
+    if status not in {"pending", "partial_claiming", "claimed", "pending_confirm", "rejected", "closed"}:
         raise HTTPException(status_code=400, detail="状态不合法")
     department = department.strip()
     team = team.strip()
