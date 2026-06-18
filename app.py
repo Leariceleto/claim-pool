@@ -77,6 +77,17 @@ FEISHU_SUPERADMIN_OPEN_IDS = {
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32)).encode()
 SESSION_COOKIE = "claim_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 天
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() not in {"0", "false", "no"}
+HSTS_ENABLED = os.environ.get("HSTS_ENABLED", "true").lower() not in {"0", "false", "no"}
+REQUIRE_LOGIN_FOR_CLAIM = os.environ.get("REQUIRE_LOGIN_FOR_CLAIM", "true").lower() not in {"0", "false", "no"}
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+RATE_LIMITS = {
+    "search": int(os.environ.get("RATE_LIMIT_SEARCH", "60")),
+    "login": int(os.environ.get("RATE_LIMIT_LOGIN", "20")),
+    "import": int(os.environ.get("RATE_LIMIT_IMPORT", "10")),
+    "export": int(os.environ.get("RATE_LIMIT_EXPORT", "20")),
+}
+RATE_BUCKETS: dict[tuple[str, str], list[float]] = {}
 
 FEISHU_AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
@@ -119,8 +130,54 @@ def compute_role(open_id: str) -> str:
 app = FastAPI(title="飞书到款认领系统 MVP")
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'",
+    )
+    if HSTS_ENABLED and request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=15552000; includeSubDomains")
+    return response
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def safe_next_url(value: str) -> str:
+    return value if value.startswith("/") and not value.startswith("//") else "/search"
+
+
+def rate_limit(request: Request, bucket: str) -> None:
+    limit = RATE_LIMITS.get(bucket, 60)
+    if limit <= 0:
+        return
+    now = time.time()
+    key = (bucket, client_ip(request))
+    recent = [t for t in RATE_BUCKETS.get(key, []) if now - t < RATE_LIMIT_WINDOW]
+    if len(recent) >= limit:
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    recent.append(now)
+    RATE_BUCKETS[key] = recent
 
 
 def get_conn() -> sqlite3.Connection:
@@ -494,7 +551,7 @@ def audit(
             action,
             payment_id,
             json.dumps(detail or {}, ensure_ascii=False),
-            request.client.host if request and request.client else "",
+            client_ip(request) if request else "",
         ),
     )
 
@@ -1062,7 +1119,8 @@ def home() -> RedirectResponse:
 
 
 @app.get("/login")
-def feishu_login(next: str = "/search") -> RedirectResponse:
+def feishu_login(request: Request, next: str = "/search") -> RedirectResponse:
+    rate_limit(request, "login")
     if not feishu_enabled():
         raise HTTPException(status_code=503, detail="尚未配置飞书登录")
     state = secrets.token_urlsafe(16)
@@ -1075,9 +1133,8 @@ def feishu_login(next: str = "/search") -> RedirectResponse:
         }
     )
     resp = RedirectResponse(authorize, status_code=302)
-    resp.set_cookie("oauth_state", state, max_age=600, httponly=True, samesite="lax")
-    safe_next = next if next.startswith("/") else "/search"
-    resp.set_cookie("oauth_next", safe_next, max_age=600, httponly=True, samesite="lax")
+    resp.set_cookie("oauth_state", state, max_age=600, httponly=True, samesite="lax", secure=COOKIE_SECURE)
+    resp.set_cookie("oauth_next", safe_next_url(next), max_age=600, httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return resp
 
 
@@ -1099,8 +1156,8 @@ def feishu_callback(request: Request, code: str = "", state: str = "") -> Redire
     name = info.get("name") or "飞书用户"
     # 会话只存身份；角色由 compute_role 每次请求实时判定（超管白名单 + 数据库管理员表）
     session = make_session({"id": open_id, "name": name, "src": "feishu"})
-    resp = RedirectResponse(next_url if next_url.startswith("/") else "/search", status_code=302)
-    resp.set_cookie(SESSION_COOKIE, session, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax")
+    resp = RedirectResponse(safe_next_url(next_url), status_code=302)
+    resp.set_cookie(SESSION_COOKIE, session, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax", secure=COOKIE_SECURE)
     resp.delete_cookie("oauth_state")
     resp.delete_cookie("oauth_next")
     with get_conn() as conn:
@@ -1232,7 +1289,25 @@ def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
 
 @app.get("/search", response_class=HTMLResponse)
 def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLResponse:
+    rate_limit(request, "search")
     actor = actor_from_request(request)
+    if not actor.get("authed"):
+        if feishu_enabled():
+            login_html = '<a href="/login?next=/search" class="login-btn">飞书登录</a>'
+            prompt = "请先通过飞书登录。登录后，组织内同事才能搜索到款并提交认领。"
+        else:
+            login_html = ""
+            prompt = "系统尚未配置飞书登录，请联系管理员配置后再使用认领搜索。"
+        body = f"""
+        <div class="panel">
+          <div class="callout info" style="margin-bottom:0">
+            <strong>认领搜索仅对组织内同事开放</strong><br>
+            {esc(prompt)}
+          </div>
+          {f'<div style="margin-top:14px">{login_html}</div>' if login_html else ''}
+        </div>
+        """
+        return page("到款认领搜索", body, active="search", subtitle="登录后可搜索到款并提交认领", actor=actor)
     q = q.strip()
     pending_date = parse_date(pending_date) if pending_date.strip() else ""
     message = ""
@@ -1458,6 +1533,8 @@ def submit_claim(
     if session:
         actor = {**actor_from_request(request), "department": department}
     else:
+        if REQUIRE_LOGIN_FOR_CLAIM:
+            raise HTTPException(status_code=403, detail="请先用飞书登录后再提交认领")
         actor = actor_from_form(user, name, role, department)
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
@@ -1766,6 +1843,7 @@ def admin_toggle_admin(
 
 @app.get("/admin/export/today")
 def export_today_payments(request: Request) -> Response:
+    rate_limit(request, "export")
     actor = actor_from_request(request)
     require_admin(actor)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -2231,6 +2309,7 @@ def admin_import(
     attachment: Optional[UploadFile] = File(None),
 ) -> RedirectResponse:
     # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
+    rate_limit(request, "import")
     actor = actor_from_request(request)
     require_admin(actor)
     source_ref = save_attachment(attachment) or source_name
