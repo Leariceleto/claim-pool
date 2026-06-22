@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time as datetime_time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
@@ -798,6 +798,101 @@ def read_table(text: str) -> list[dict[str, str]]:
                 item[headers[index]] = value.strip()
         result.append(item)
     return result
+
+
+def excel_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime_time):
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def rows_from_excel_matrix(matrix: list[list[Any]]) -> list[dict[str, str]]:
+    rows = [
+        [excel_value_text(value) for value in row]
+        for row in matrix
+        if any(excel_value_text(value) for value in row)
+    ]
+    if not rows:
+        return []
+
+    required_headers = {"received_date", "payer_name", "amount"}
+    header_index = None
+    headers: list[str] = []
+    for index, row in enumerate(rows[:20]):
+        candidate = [canonical_header(cell) for cell in row]
+        if len(required_headers & set(candidate)) >= 2:
+            header_index = index
+            headers = candidate
+            break
+
+    if header_index is None:
+        header_index = -1
+        headers = [
+            "received_date",
+            "payer_name",
+            "amount",
+            "bank_note",
+            "serial_no",
+            "receiver_account",
+        ]
+
+    result = []
+    for row in rows[header_index + 1:]:
+        item = {
+            headers[index]: value.strip()
+            for index, value in enumerate(row)
+            if index < len(headers) and headers[index]
+        }
+        if any(item.values()):
+            result.append(item)
+    return result
+
+
+def rows_from_excel(path: Path) -> list[dict[str, str]]:
+    suffix = path.suffix.lower()
+    rows: list[dict[str, str]] = []
+    try:
+        if suffix == ".xlsx":
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(path, read_only=True, data_only=True)
+            try:
+                for worksheet in workbook.worksheets:
+                    matrix = [list(row) for row in worksheet.iter_rows(values_only=True)]
+                    rows.extend(rows_from_excel_matrix(matrix))
+            finally:
+                workbook.close()
+        elif suffix == ".xls":
+            import xlrd
+
+            workbook = xlrd.open_workbook(path, on_demand=True)
+            try:
+                for worksheet in workbook.sheets():
+                    matrix = []
+                    for row_index in range(worksheet.nrows):
+                        row = []
+                        for cell in worksheet.row(row_index):
+                            value: Any = cell.value
+                            if cell.ctype == xlrd.XL_CELL_DATE:
+                                value = xlrd.xldate.xldate_as_datetime(value, workbook.datemode)
+                            row.append(value)
+                        matrix.append(row)
+                    rows.extend(rows_from_excel_matrix(matrix))
+            finally:
+                workbook.release_resources()
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"缺少 Excel 解析依赖：{exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Excel 文件无法读取，请确认文件未损坏且未加密：{exc}") from exc
+    return rows
 
 
 def extract_pdf_text(path: Path) -> str:
@@ -2103,7 +2198,7 @@ def admin_page(request: Request) -> HTMLResponse:
             <input type="file" name="attachment" accept=".png,.jpg,.jpeg,.pdf,.csv,.xls,.xlsx">
           </div>
         </div>
-        <p class="hint">可上传银行截图、PDF、CSV 或 Excel 文件。第一版只保存凭证，不自动识别附件内容。</p>
+        <p class="hint">可上传 PDF、.xls 或 .xlsx 文件；Excel 会自动读取所有非空工作表。</p>
         <div class="field">
           <label>CSV / TSV / 表格文本</label>
           <textarea name="table_text" placeholder="到款日期,付款方名称,到款金额,银行备注,流水号"></textarea>
@@ -2314,12 +2409,17 @@ def admin_import(
     require_admin(actor)
     source_ref = save_attachment(attachment) or source_name
     rows = read_table(table_text)
-    if not rows and source_ref.startswith("uploads/") and Path(source_ref).suffix.lower() == ".pdf":
-        rows, reason = rows_from_pdf(UPLOAD_DIR / Path(source_ref).name)
-        if not rows:
-            raise HTTPException(status_code=400, detail=reason)
+    if not rows and source_ref.startswith("uploads/"):
+        source_path = UPLOAD_DIR / Path(source_ref).name
+        suffix = source_path.suffix.lower()
+        if suffix == ".pdf":
+            rows, reason = rows_from_pdf(source_path)
+            if not rows:
+                raise HTTPException(status_code=400, detail=reason)
+        elif suffix in {".xls", ".xlsx"}:
+            rows = rows_from_excel(source_path)
     if not rows:
-        raise HTTPException(status_code=400, detail="未识别到任何流水。请粘贴 CSV / TSV / 表格文本，或上传可复制文本 PDF。")
+        raise HTTPException(status_code=400, detail="未识别到任何流水。请粘贴 CSV / TSV / 表格文本，或上传 PDF / Excel 文件。")
     with get_conn() as conn:
         cur = conn.execute(
             """
