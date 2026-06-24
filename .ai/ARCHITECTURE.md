@@ -41,7 +41,7 @@ FastAPI (app.py, uvicorn)
 | 区块 | 职责 |
 |---|---|
 | 配置区（顶部） | `load_dotenv` 读 `.env`；DB/上传路径、飞书配置、超管白名单、会话密钥等常量 |
-| `CATALOG` | 启动时从 `catalog.json` 读入的三级分类字典；`DEPARTMENTS` 为部门列表 |
+| `BASE_CATALOG` / `CATALOG` | `catalog.json` 提供基础三级分类，启动时合并 SQLite 的财务项目增删覆盖层 |
 | `init_db` / `ensure_column` | 建表 + 增量加列（迁移用，幂等，不破坏已有数据） |
 | 会话工具 | `make_session` / `read_session`：HMAC 签名的 cookie，存 `{id, name, src, exp}`，不存角色 |
 | 飞书 API | `_feishu_request`（urllib 封装）/ `feishu_exchange_token` / `feishu_get_userinfo` / `feishu_tenant_token` / `feishu_send_text` |
@@ -63,6 +63,7 @@ FastAPI (app.py, uvicorn)
 | GET `/me` | 登录 | 个人中心 |
 | POST `/me/profile` | 登录 | 设置本人部门 |
 | GET `/admin` | 管理员 | 管理后台 |
+| POST `/admin/catalog/projects` | 管理员 | 在现有部门/中心下新增或删除项目 |
 | POST `/admin/import` | 管理员 | 导入流水 |
 | POST `/admin/batches/{id}/confirm` | 管理员 | 确认入池（draft→pending） |
 | POST `/admin/payments/{id}/edit` | 管理员 | 编辑流水字段 |
@@ -73,7 +74,7 @@ FastAPI (app.py, uvicorn)
 | POST `/admin/admins/{open_id}` | **超级管理员** | 勾选/取消管理员 |
 | GET `/attachments/{filename}` | 管理员 | 下载凭证附件 |
 
-## 数据模型（SQLite，6 张表）
+## 数据模型（SQLite，7 张表）
 
 - **payments**：到款主表。`status` 取值 `draft`(待确认入池)/`pending`(待认领)/`claimed`(已认领)/`pending_confirm`(多人认领待确认)/`rejected`/`closed`。金额存 `amount_cents`（分）。认领归属字段 `claimed_department/claimed_team/claimed_by/claimed_by_name/customer_project` 等。
 - **claims**：每次认领动作的流水记录（含冲突认领），关联 `payment_id`。
@@ -81,10 +82,12 @@ FastAPI (app.py, uvicorn)
 - **audit_logs**：操作审计（动作名 + JSON 详情 + 操作人角色 + IP）。
 - **user_profiles**：用户的部门设置（`open_id → department, team`）。
 - **app_users**：所有登录过的用户（`open_id, name, is_admin, last_login`）；`is_admin` 由超管在后台勾选。
+- **catalog_project_changes**：财务对项目的新增/删除覆盖层（`department, team, project, active`）；删除是停用选项，不删历史认领文本。
 
 ## 关键数据流
 
 1. **登录**：`/login` → 飞书授权 → `/oauth/callback` 用 code 换 user_access_token → 拿 open_id/name → `make_session` 写 cookie + upsert `app_users` → 重定向。
 2. **角色判定**（每请求实时）：`actor_from_request` 读会话 → `compute_role(open_id)`：在超管白名单 `FEISHU_SUPERADMIN_OPEN_IDS` → `superadmin`；在 `app_users.is_admin` → `admin`；否则 `claimant`。**会话 cookie 不存角色**，所以改管理员后对方刷新即生效。
-3. **认领**：选三级分类（前端联动 + 后端校验必须匹配 `catalog.json`）→ 写 `claims` + 更新 `payments`。已被他人认领时进 `pending_confirm`。
-4. **驳回退回**：`/admin/.../reject` → `feishu_send_text` 通知原 `claimed_by` → `payments` 置回 `pending` 并清空认领归属 → 写审计。发消息失败不阻断退回。
+3. **项目目录**：启动时加载 `catalog.json` 基础目录 → 按 `catalog_project_changes` 增加或隐藏项目 → 生成运行时 `CATALOG`。
+4. **认领**：选三级分类（前端联动 + 后端校验必须匹配运行时 `CATALOG`）→ 写 `claims` + 更新 `payments`。已被他人认领时进 `pending_confirm`。
+5. **驳回退回**：`/admin/.../reject` → `feishu_send_text` 通知原 `claimed_by` → `payments` 置回 `pending` 并清空认领归属 → 写审计。发消息失败不阻断退回。

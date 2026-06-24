@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
@@ -51,10 +51,14 @@ BROAD_TERMS = {"公司", "有限公司", "集团", "科技", "教育", "转账",
 # 部门 → 中心/小组 → 项目 三级分类，来源：智库产品分类.xlsx
 # 更新分类时直接替换 catalog.json 即可，无需改代码
 CATALOG_PATH = Path(os.environ.get("CLAIM_CATALOG", APP_DIR / "catalog.json"))
-CATALOG: dict[str, dict[str, list[str]]] = (
+BASE_CATALOG: dict[str, dict[str, list[str]]] = (
     json.loads(CATALOG_PATH.read_text("utf-8")) if CATALOG_PATH.is_file() else {}
 )
-DEPARTMENTS = list(CATALOG)
+CATALOG: dict[str, dict[str, list[str]]] = {
+    department: {team: list(projects) for team, projects in teams.items()}
+    for department, teams in BASE_CATALOG.items()
+}
+DEPARTMENTS = list(BASE_CATALOG)
 
 # ── 飞书登录配置 ──────────────────────────────────────────────
 # 这些值从 .env 读取（见 .env.example）。未配置时飞书登录入口自动隐藏，
@@ -186,6 +190,33 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def refresh_catalog(conn: Optional[sqlite3.Connection] = None) -> None:
+    CATALOG.clear()
+    CATALOG.update(
+        {
+            department: {team: list(projects) for team, projects in teams.items()}
+            for department, teams in BASE_CATALOG.items()
+        }
+    )
+    owns_conn = conn is None
+    catalog_conn = conn or get_conn()
+    try:
+        rows = catalog_conn.execute(
+            "SELECT department, team, project, active FROM catalog_project_changes ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            projects = CATALOG.get(row["department"], {}).get(row["team"])
+            if projects is None:
+                continue
+            if row["active"] and row["project"] not in projects:
+                projects.append(row["project"])
+            elif not row["active"] and row["project"] in projects:
+                projects.remove(row["project"])
+    finally:
+        if owns_conn:
+            catalog_conn.close()
+
+
 def init_db() -> None:
     UPLOAD_DIR.mkdir(exist_ok=True)
     with get_conn() as conn:
@@ -269,6 +300,18 @@ def init_db() -> None:
                 last_login TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS catalog_project_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                department TEXT NOT NULL,
+                team TEXT NOT NULL,
+                project TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                updated_by_name TEXT NOT NULL,
+                UNIQUE(department, team, project)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
             CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(received_date);
             CREATE INDEX IF NOT EXISTS idx_claims_payment ON claims(payment_id);
@@ -276,8 +319,14 @@ def init_db() -> None:
             """
         )
         ensure_column(conn, "payments", "claimed_team", "claimed_team TEXT")
+        ensure_column(conn, "payments", "closed_at", "closed_at TEXT")
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "UPDATE payments SET closed_at = ? WHERE status = 'closed' AND COALESCE(closed_at, '') = ''",
+            (now_text(),),
+        )
+        refresh_catalog(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -629,6 +678,7 @@ BASE_CSS = """
     tbody tr:last-child td { border-bottom:0; }
     tbody tr:hover { background:#fafbfd; }
     td.num { font-variant-numeric:tabular-nums; font-weight:600; white-space:nowrap; }
+    td.payment-summary { min-width:280px; white-space:normal; overflow-wrap:anywhere; }
     td.empty { padding:36px; text-align:center; color:var(--faint); }
     .code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px;
       color:var(--muted); word-break:break-all; }
@@ -750,10 +800,30 @@ def page(
 
 
 HEADER_ALIASES = {
-    "received_date": {"到款日期", "日期", "入账日期", "交易日期", "date"},
+    "received_date": {"到款日期", "日期", "入账日期", "交易日期", "交易日", "date"},
     "received_time": {"到款时间", "时间", "交易时间", "time"},
-    "payer_name": {"付款方名称", "付款方", "对方户名", "对方名称", "客户名称", "payer", "payer_name"},
-    "amount": {"到款金额", "金额", "收入金额", "贷方发生额", "入账金额", "amount"},
+    "payer_name": {
+        "付款方名称",
+        "付款方",
+        "对方户名",
+        "对方名称",
+        "客户名称",
+        "收(付)方名称",
+        "收（付）方名称",
+        "payer",
+        "payer_name",
+    },
+    "amount": {
+        "到款金额",
+        "金额",
+        "收入金额",
+        "贷方金额",
+        "贷方金额（元）",
+        "贷方金额(元)",
+        "贷方发生额",
+        "入账金额",
+        "amount",
+    },
     "bank_note": {"银行备注", "摘要", "备注", "用途", "附言", "note", "remark"},
     "receiver_account": {"收款账户", "账号", "账户", "account"},
     "serial_no": {"流水号", "回单号", "凭证号", "serial_no", "serial"},
@@ -1318,9 +1388,15 @@ document.addEventListener('change', function (e) {
 
 
 def catalog_script() -> str:
+    catalog_json = (
+        json.dumps(CATALOG, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
     return (
         "<script>var CATALOG = "
-        + json.dumps(CATALOG, ensure_ascii=False)
+        + catalog_json
         + ";"
         + CASCADE_JS
         + "</script>"
@@ -1458,7 +1534,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
             pending_rows = conn.execute(
                 """
                 SELECT * FROM payments
-                WHERE status = 'pending' AND received_date = ?
+                WHERE status IN ('pending', 'partial_claiming') AND received_date = ?
                 ORDER BY id DESC
                 LIMIT 50
                 """,
@@ -1469,7 +1545,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
             pending_rows = conn.execute(
                 """
                 SELECT * FROM payments
-                WHERE status = 'pending'
+                WHERE status IN ('pending', 'partial_claiming')
                 ORDER BY received_date DESC, id DESC
                 LIMIT 50
                 """
@@ -2059,6 +2135,7 @@ def render_batch_actions(row: sqlite3.Row, actor: dict[str, str]) -> str:
 def admin_page(request: Request) -> HTMLResponse:
     actor = actor_from_request(request)
     require_admin(actor)
+    closed_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         stats = conn.execute(
             """
@@ -2068,7 +2145,17 @@ def admin_page(request: Request) -> HTMLResponse:
             """
         ).fetchall()
         batches = conn.execute("SELECT * FROM import_batches ORDER BY id DESC LIMIT 10").fetchall()
-        payments = conn.execute("SELECT * FROM payments ORDER BY id DESC LIMIT 100").fetchall()
+        payments = conn.execute(
+            """
+            SELECT * FROM payments
+            WHERE status != 'closed'
+               OR COALESCE(closed_at, '') = ''
+               OR closed_at > ?
+            ORDER BY id DESC
+            LIMIT 100
+            """,
+            (closed_cutoff,),
+        ).fetchall()
         logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 30").fetchall()
         profiles = conn.execute(
             "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
@@ -2207,6 +2294,26 @@ def admin_page(request: Request) -> HTMLResponse:
       </form>
     </div>
 
+    <h2>项目管理</h2>
+    <div class="panel">
+      <form method="post" action="/admin/catalog/projects" class="row" style="align-items:end">
+        {finance_hidden(actor)}
+        <input type="hidden" name="action" value="add">
+        <div style="min-width:180px; flex:1"><label>部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
+        <div style="min-width:180px; flex:1"><label>中心 / 小组</label>{team_select("team", "", required=True)}</div>
+        <div style="min-width:220px; flex:1.4"><label>新项目名称</label><input name="project" maxlength="100" required></div>
+        <div><button type="submit">添加项目</button></div>
+      </form>
+      <form method="post" action="/admin/catalog/projects" class="row" style="align-items:end; border-top:1px solid var(--line); margin-top:16px; padding-top:16px" onsubmit="return confirm('确定删除这个项目吗？历史认领记录会保留，但后续无法再选择该项目。')">
+        {finance_hidden(actor)}
+        <input type="hidden" name="action" value="delete">
+        <div style="min-width:180px; flex:1"><label>部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
+        <div style="min-width:180px; flex:1"><label>中心 / 小组</label>{team_select("team", "", required=True)}</div>
+        <div style="min-width:220px; flex:1.4"><label>项目</label>{project_select("project", "", "", required=True)}</div>
+        <div><button class="danger" type="submit">删除项目</button></div>
+      </form>
+    </div>
+
     <h2>最近导入批次</h2>
     <div class="table-wrap">
     <table>
@@ -2218,7 +2325,7 @@ def admin_page(request: Request) -> HTMLResponse:
     <h2>全量认领池</h2>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>日期</th><th>金额</th><th>付款方 / 备注</th><th>状态 / 认领</th><th style="width:320px">管理操作</th></tr></thead>
+      <thead><tr><th>ID</th><th>日期</th><th>金额</th><th>付款方 / 摘要</th><th>状态 / 认领</th><th style="width:320px">管理操作</th></tr></thead>
       <tbody>{payment_rows or '<tr><td colspan="6" class="empty">暂无记录</td></tr>'}</tbody>
     </table>
     </div>
@@ -2241,7 +2348,66 @@ def admin_page(request: Request) -> HTMLResponse:
     </div>
     {catalog_script()}
     """
-    return page("管理后台", body, active="admin", subtitle="导入流水、确认入池、处理认领、成员部门与操作日志", actor=actor)
+    return page("管理后台", body, active="admin", subtitle="导入流水、管理项目、处理认领与操作日志", actor=actor)
+
+
+@app.post("/admin/catalog/projects")
+def admin_catalog_project(
+    request: Request,
+    action: str = Form(...),
+    department: str = Form(...),
+    team: str = Form(...),
+    project: str = Form(...),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    department = require_department(department)
+    team = team.strip()
+    project = re.sub(r"\s+", " ", project).strip()
+    if team not in BASE_CATALOG.get(department, {}):
+        raise HTTPException(status_code=400, detail="请选择该部门下的现有中心/小组")
+    if not project or len(project) > 100:
+        raise HTTPException(status_code=400, detail="项目名称需为 1-100 个字符")
+    visible_projects = CATALOG.get(department, {}).get(team, [])
+    if action == "add":
+        if project in visible_projects:
+            raise HTTPException(status_code=409, detail="该项目已存在")
+        active = 1
+        audit_action = "add_catalog_project"
+    elif action == "delete":
+        if project not in visible_projects:
+            raise HTTPException(status_code=404, detail="项目不存在或已删除")
+        if len(visible_projects) <= 1:
+            raise HTTPException(status_code=409, detail="不能删除该中心/小组的最后一个项目")
+        active = 0
+        audit_action = "delete_catalog_project"
+    else:
+        raise HTTPException(status_code=400, detail="项目操作不合法")
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO catalog_project_changes
+                (department, team, project, active, updated_at, updated_by, updated_by_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(department, team, project) DO UPDATE SET
+                active = excluded.active,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by,
+                updated_by_name = excluded.updated_by_name
+            """,
+            (department, team, project, active, now_text(), actor["id"], actor["name"]),
+        )
+        audit(
+            conn,
+            actor,
+            audit_action,
+            None,
+            {"department": department, "team": team, "project": project},
+            request,
+        )
+    refresh_catalog()
+    return RedirectResponse("/admin", status_code=303)
 
 
 def finance_hidden(actor: dict[str, str]) -> str:
@@ -2273,8 +2439,6 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
     finance_note = ""
     if row["finance_note"]:
         finance_note = f'<div class="muted">管理备注：{esc(row["finance_note"])}</div>'
-    attachment = attachment_link(row["source_ref"] or "", actor)
-    source = attachment or esc(row["source_ref"])
     # 仅对已有人认领的单子（已认领/待确认）显示「驳回退回」
     reject_ui = ""
     if row["status"] in {"claimed", "pending_confirm"}:
@@ -2295,10 +2459,9 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
       <td class="nowrap">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
       <td class="nowrap">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
       <td class="num">¥ {money(row['amount_cents'])}</td>
-      <td>
+      <td class="payment-summary">
         <strong>{esc(row['payer_name'])}</strong>
         <div>{esc(row['bank_note'])}</div>
-        <div class="muted">流水号 {esc(row['serial_no'])} · 凭证 {source}</div>
       </td>
       <td>{status_badge(row['status'])}{claimed}{finance_note}</td>
       <td class="actions">
@@ -2720,6 +2883,7 @@ def resolve_payment(
                     claimed_by = NULL,
                     claimed_by_name = NULL,
                     claimed_at = NULL,
+                    closed_at = NULL,
                     finance_note = ?
                 WHERE id = ?
                 """,
@@ -2732,10 +2896,14 @@ def resolve_payment(
                 SET status = ?,
                     claimed_department = COALESCE(NULLIF(?, ''), claimed_department),
                     claimed_team = COALESCE(NULLIF(?, ''), claimed_team),
+                    closed_at = CASE
+                        WHEN ? = 'closed' THEN COALESCE(NULLIF(closed_at, ''), ?)
+                        ELSE NULL
+                    END,
                     finance_note = ?
                 WHERE id = ?
                 """,
-                (status, department, team, finance_note, payment_id),
+                (status, department, team, status, now_text(), finance_note, payment_id),
             )
         audit(conn, actor, "resolve_payment", payment_id, {"status": status, "department": department, "team": team}, request)
     return RedirectResponse("/admin", status_code=303)

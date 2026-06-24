@@ -18,7 +18,7 @@
 
 ## 项目约定
 
-- **`catalog.json` 是部门/中心/项目的唯一数据源**。调整分类只改这个 JSON 文件，不改代码。三级结构：`{部门: {中心: [项目, ...]}}`。
+- **`catalog.json` 是基础部门/中心/项目数据源**，三级结构为 `{部门: {中心: [项目, ...]}}`。财务在后台的项目增删存入 SQLite `catalog_project_changes`，由 `refresh_catalog()` 与基础目录合并。不要用重读 JSON 覆盖运行时目录，也不要删历史认领文本。
 - **数据库迁移用 `ensure_column(conn, table, column, ddl)` 模式**（幂等加列），不要写破坏性 DDL、不要丢已有数据。新表用 `CREATE TABLE IF NOT EXISTS` 加进 `init_db`。
 - 启动会自动 `init_db()` 建表/补列，无需手动初始化。
 - **敏感配置走 `.env`**（飞书 Secret、`SESSION_SECRET`），`.env` 已在 `.gitignore`，**绝不提交**。新增配置项同步更新 `.env.example`。
