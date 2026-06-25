@@ -81,7 +81,18 @@ FEISHU_SUPERADMIN_OPEN_IDS = {
 SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32)).encode()
 SESSION_COOKIE = "claim_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 天
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").lower() not in {"0", "false", "no"}
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no"}
+
+
+# 未显式配置时，按回调地址协议决定 cookie 是否加 Secure。
+# HTTP 临时部署可登录；HTTPS 正式部署仍默认走安全 cookie。
+COOKIE_SECURE = env_bool("COOKIE_SECURE", FEISHU_REDIRECT_URI.lower().startswith("https://"))
 HSTS_ENABLED = os.environ.get("HSTS_ENABLED", "true").lower() not in {"0", "false", "no"}
 REQUIRE_LOGIN_FOR_CLAIM = os.environ.get("REQUIRE_LOGIN_FOR_CLAIM", "true").lower() not in {"0", "false", "no"}
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
