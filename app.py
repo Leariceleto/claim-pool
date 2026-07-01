@@ -278,6 +278,7 @@ def init_db() -> None:
                 payer_name TEXT,
                 amount_cents INTEGER NOT NULL DEFAULT 0,
                 bank_note TEXT,
+                receiver_company TEXT,
                 receiver_account TEXT,
                 serial_no TEXT,
                 source_ref TEXT,
@@ -327,6 +328,18 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_scopes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                open_id TEXT NOT NULL,
+                department TEXT NOT NULL,
+                team TEXT,
+                label TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_by_name TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS app_users (
                 open_id TEXT PRIMARY KEY,
                 name TEXT,
@@ -356,6 +369,7 @@ def init_db() -> None:
         )
         ensure_column(conn, "payments", "claimed_team", "claimed_team TEXT")
         ensure_column(conn, "payments", "closed_at", "closed_at TEXT")
+        ensure_column(conn, "payments", "receiver_company", "receiver_company TEXT")
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "app_users", "managed_role", "managed_role TEXT NOT NULL DEFAULT 'claimant'")
@@ -387,6 +401,10 @@ def url(path: str, **params: str) -> str:
 
 def money(cents: Optional[int]) -> str:
     return f"{(cents or 0) / 100:,.2f}"
+
+
+def receiver_company_label(value: Any) -> str:
+    return str(value or "").strip() or "未填写"
 
 
 def parse_amount(value: Any) -> int:
@@ -572,6 +590,84 @@ def can_self_set_profile(conn: sqlite3.Connection, open_id: str) -> bool:
     return not ((row["department"] or "").strip() and (row["team"] or "").strip())
 
 
+def get_user_scopes(conn: sqlite3.Connection, open_id: str, active_only: bool = True) -> list[sqlite3.Row]:
+    if not open_id:
+        return []
+    where = "WHERE open_id = ?"
+    params: list[Any] = [open_id]
+    if active_only:
+        where += " AND active = 1"
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM user_scopes
+        {where}
+        ORDER BY id DESC
+        """,
+        params,
+    ).fetchall()
+
+
+def scope_display_label(department: str, team: str = "", label: str = "") -> str:
+    label = (label or "").strip()
+    if label:
+        return label
+    team = (team or "").strip()
+    return f"{department} / {team}" if team else department
+
+
+def dashboard_scope_choices(
+    actor: dict[str, Any],
+    extra_scopes: list[sqlite3.Row],
+) -> list[dict[str, Any]]:
+    scope_items: list[dict[str, Any]] = []
+
+    def add_scope(key: str, label: str, department: str, team: str = "") -> None:
+        department = (department or "").strip()
+        team = (team or "").strip()
+        if department not in DEPARTMENTS:
+            return
+        if team and team not in CATALOG.get(department, {}):
+            return
+        identity = (department, team)
+        if any(item["identity"] == identity for item in scope_items):
+            return
+        scope_items.append(
+            {
+                "key": key,
+                "label": label,
+                "identity": identity,
+                "scopes": [{"department": department, "team": team}],
+            }
+        )
+
+    primary_department = actor.get("department", "")
+    primary_team = actor.get("team", "")
+    add_scope(
+        "primary",
+        "主身份：" + scope_display_label(primary_department, primary_team),
+        primary_department,
+        primary_team,
+    )
+    for row in extra_scopes:
+        add_scope(
+            f"extra:{row['id']}",
+            scope_display_label(row["department"], row["team"] or "", row["label"] or ""),
+            row["department"],
+            row["team"] or "",
+        )
+
+    all_scopes = []
+    seen: set[tuple[str, str]] = set()
+    for item in scope_items:
+        for scope in item["scopes"]:
+            identity = (scope["department"], scope.get("team", ""))
+            if identity not in seen:
+                seen.add(identity)
+                all_scopes.append(scope)
+    return [{"key": "all", "label": "全部角色", "scopes": all_scopes, "identity": ("", "")}, *scope_items]
+
+
 def actor_from_request(request: Request) -> dict[str, str]:
     session = read_session(request.cookies.get(SESSION_COOKIE, ""))
     if session:
@@ -748,6 +844,7 @@ BASE_CSS = """
     .status.claimed { background:#dcf5e7; color:#13794c; }
     .status.pending_confirm { background:#fdeaec; color:#b4232e; }
     .status.rejected { background:#efeff2; color:#6b7280; }
+    .status.canceled { background:#efeff2; color:#6b7280; }
     .status.closed { background:#e7e9fd; color:#4341c8; }
 
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:14px; margin-bottom:8px; }
@@ -774,6 +871,11 @@ BASE_CSS = """
     details.fold[open] summary::before { transform:rotate(90deg); }
     details.fold .fold-body { padding:10px 12px 12px; border-top:1px dashed var(--line); }
     .actions { min-width:300px; }
+    .split-form-cell { padding:0 16px 16px; background:#fff; }
+    .split-form-cell details.fold { margin:0; }
+    .split-form-cell details.fold .fold-body { padding:16px; }
+    .split-form-table { min-width:960px; }
+    .split-form-table th:last-child, .split-form-table td:last-child { min-width:260px; }
     .confirm-claim-form { margin-top:10px; }
     .confirm-claim-form button { width:100%; }
     .bulk-bar { display:flex; justify-content:space-between; align-items:center; gap:12px;
@@ -837,9 +939,11 @@ def page(
     # 携带身份参数在页面间跳转，为后续接入飞书登录后透传用户身份做准备
     ident = identity_params(actor)
     search_href = url("/search", **ident) if ident else "/search"
+    split_href = url("/split-claim", **ident) if ident else "/split-claim"
     me_href = url("/me", **ident) if ident else "/me"
     nav_items = [
         (search_href, "认领搜索", "search"),
+        (split_href, "分摊认领", "split"),
         (me_href, "个人中心", "me"),
     ]
     # 管理后台仅对真实管理员可见；不再用 ?role=admin 给所有人埋后门入口
@@ -917,6 +1021,18 @@ HEADER_ALIASES = {
         "amount",
     },
     "bank_note": {"银行备注", "摘要", "备注", "用途", "附言", "付款附言", "note", "remark"},
+    "receiver_company": {
+        "到款公司",
+        "收款公司",
+        "收款方",
+        "收款方名称",
+        "收款户名",
+        "收款单位",
+        "收款人",
+        "收款人名称",
+        "我方公司",
+        "receiver_company",
+    },
     "receiver_account": {"收款账户", "账号", "账户", "account"},
     "serial_no": {"流水号", "回单号", "凭证号", "检索号", "商户订单号", "银商订单号", "serial_no", "serial"},
 }
@@ -968,6 +1084,7 @@ def read_table(text: str) -> list[dict[str, str]]:
         "bank_note",
         "serial_no",
         "receiver_account",
+        "receiver_company",
     ]
 
     result = []
@@ -1025,6 +1142,7 @@ def rows_from_excel_matrix(matrix: list[list[Any]]) -> list[dict[str, str]]:
             "bank_note",
             "serial_no",
             "receiver_account",
+            "receiver_company",
         ]
 
     result = []
@@ -1144,6 +1262,7 @@ def parse_pdf_receipts(text: str) -> list[dict[str, str]]:
         received_date = first_match(block, [r"交易日期[:：]\s*([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2})"])
         received_time = first_match(block, [r"交易时间[:：]\s*([0-9]{1,2}[:：][0-9]{2}(?::[0-9]{2})?)"])
         payer_name = first_match(block, [r"付款账户户名[:：]\s*([^\n]+)", r"付款人[:：]\s*([^\n]+)"])
+        receiver_company = first_match(block, [r"收款账户户名[:：]\s*([^\n]+)", r"收款户名[:：]\s*([^\n]+)", r"收款人[:：]\s*([^\n]+)"])
         receiver_account = first_match(block, [r"收款账号[:：]\s*([0-9A-Za-z* ]+)", r"收款账户[:：]\s*([0-9A-Za-z* ]+)"])
         serial_no = first_match(block, [r"业务编号[:：]\s*([0-9A-Za-z]+)", r"回单编号[:：]\s*([0-9A-Za-z]+)", r"流水号[:：]\s*([0-9A-Za-z]+)"])
         amount = first_match(
@@ -1164,6 +1283,7 @@ def parse_pdf_receipts(text: str) -> list[dict[str, str]]:
                     "payer_name": payer_name,
                     "amount": amount,
                     "bank_note": bank_note,
+                    "receiver_company": receiver_company,
                     "receiver_account": receiver_account,
                     "serial_no": serial_no,
                 }
@@ -1267,6 +1387,7 @@ def bank_slip_infos_to_row(infos: list[dict[str, Any]]) -> dict[str, str]:
     )
     amount = bank_slip_value(info_map, ["交易金额", "金额小写", "金额"])
     bank_note = bank_slip_value(info_map, ["附言", "摘要", "用途", "备注"])
+    receiver_company = bank_slip_value(info_map, ["收款账户户名", "收款户名", "收款方户名", "收款人户名", "收款人", "收款方"])
     receiver_account = bank_slip_value(info_map, ["收款账号", "收款账户", "收款人账号"])
     serial_no = bank_slip_value(info_map, ["流水号", "回单编号", "业务编号", "凭证号码"])
     return {
@@ -1275,6 +1396,7 @@ def bank_slip_infos_to_row(infos: list[dict[str, Any]]) -> dict[str, str]:
         "payer_name": payer_name,
         "amount": amount,
         "bank_note": bank_note,
+        "receiver_company": receiver_company,
         "receiver_account": receiver_account,
         "serial_no": serial_no,
     }
@@ -1365,6 +1487,7 @@ def status_badge(status: str) -> str:
         "claimed": "已确认",
         "pending_confirm": "待财务确认",
         "rejected": "已驳回",
+        "canceled": "已取消",
         "closed": "已关闭",
     }
     return f'<span class="status {esc(status)}">{esc(labels.get(status, status))}</span>'
@@ -1515,14 +1638,15 @@ function fillSelect(sel, items, placeholder) {
   }
 }
 document.addEventListener('change', function (e) {
-  var form = e.target.closest('form');
-  if (!form) return;
+  var scope = e.target.closest('.cascade-scope') || e.target.closest('form');
+  if (!scope) return;
   if (e.target.classList.contains('cs-dept')) {
-    fillSelect(form.querySelector('.cs-team'), Object.keys(CATALOG[e.target.value] || {}), '请选择中心/小组');
-    fillSelect(form.querySelector('.cs-project'), [], '请先选择中心/小组');
+    fillSelect(scope.querySelector('.cs-team'), Object.keys(CATALOG[e.target.value] || {}), '请选择中心/小组');
+    fillSelect(scope.querySelector('.cs-project'), [], '请先选择中心/小组');
   } else if (e.target.classList.contains('cs-team')) {
-    var dept = form.querySelector('.cs-dept').value;
-    fillSelect(form.querySelector('.cs-project'), (CATALOG[dept] || {})[e.target.value] || [], '请选择项目');
+    var deptInput = scope.querySelector('.cs-dept');
+    var dept = deptInput ? deptInput.value : '';
+    fillSelect(scope.querySelector('.cs-project'), (CATALOG[dept] || {})[e.target.value] || [], '请选择项目');
   }
 });
 """
@@ -1743,6 +1867,156 @@ def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
     """
 
 
+def split_claim_line_rows(count: int = 6) -> str:
+    rows = []
+    for index in range(count):
+        rows.append(
+            f"""
+            <tr class="cascade-scope">
+              <td>{index + 1}</td>
+              <td>{department_select("departments", required=False, class_name="cs-dept")}</td>
+              <td>{team_select("teams", "", required=False)}</td>
+              <td>{project_select("projects", "", "", required=False)}</td>
+              <td><input name="amounts" placeholder="0.00"></td>
+              <td><input name="notes" placeholder="如：2本杂志 / 3个笔记本 / 2个参会名额"></td>
+            </tr>
+            """
+        )
+    return "".join(rows)
+
+
+def split_claim_form_html(row: sqlite3.Row) -> str:
+    return f"""
+    <details class="fold">
+      <summary>填写分摊明细</summary>
+      <div class="fold-body">
+        <form method="post" action="/split-claim/{row['id']}">
+          <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); margin-bottom:14px">
+            <div class="stat" style="--dot:#2456d6"><span class="stat-label">到款金额</span><strong>¥ {money(row["amount_cents"])}</strong></div>
+            <div class="stat" style="--dot:#16a34a"><span class="stat-label">当前状态</span><strong style="font-size:18px">{status_badge(row["status"])}</strong></div>
+          </div>
+          <div class="table-wrap split-form-table" style="box-shadow:none; margin-bottom:12px">
+            <table>
+              <thead><tr><th>#</th><th>部门</th><th>中心 / 小组</th><th>项目</th><th>分摊金额</th><th>备注</th></tr></thead>
+              <tbody>{split_claim_line_rows()}</tbody>
+            </table>
+          </div>
+          <p class="hint" style="margin:0 0 12px">只填写需要分摊的行；分摊金额合计不能超过该笔款剩余可认领金额。</p>
+          <button type="submit">提交分摊认领</button>
+        </form>
+      </div>
+    </details>
+    """
+
+
+def split_claim_candidates(conn: sqlite3.Connection, q: str) -> list[sqlite3.Row]:
+    compact = q.strip()
+    if not compact:
+        return []
+    id_match = re.fullmatch(r"#?\s*(\d+)", compact)
+    if id_match:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE id = ?
+              AND status IN ('pending', 'partial_claiming', 'claimed', 'pending_confirm')
+            """,
+            (int(id_match.group(1)),),
+        ).fetchone()
+        return [row] if row else []
+    return run_search(conn, q)
+
+
+def submit_split_claims(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    payment_id: int,
+    departments: list[str],
+    teams: list[str],
+    projects: list[str],
+    amounts: list[str],
+    notes: list[str],
+    request: Optional[Request] = None,
+) -> dict[str, Any]:
+    payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    if not payment:
+        raise HTTPException(status_code=404, detail="到款记录不存在")
+    if payment["status"] not in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
+        raise HTTPException(status_code=409, detail="这笔款当前状态不能分摊认领")
+
+    line_count = max(len(departments), len(teams), len(projects), len(amounts), len(notes))
+    lines: list[dict[str, Any]] = []
+    for index in range(line_count):
+        department = departments[index].strip() if index < len(departments) else ""
+        team = teams[index].strip() if index < len(teams) else ""
+        project = projects[index].strip() if index < len(projects) else ""
+        amount_text = amounts[index].strip() if index < len(amounts) else ""
+        note = notes[index].strip() if index < len(notes) else ""
+        if not any([department, team, project, amount_text, note]):
+            continue
+        if not department or not team or not project or not amount_text:
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行分摊明细不完整")
+        department = require_department(department)
+        if team not in CATALOG.get(department, {}):
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行中心/小组不属于所选部门")
+        if project not in CATALOG[department][team]:
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行项目不属于所选中心/小组")
+        amount_cents = parse_amount(amount_text)
+        if amount_cents <= 0:
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行分摊金额必须大于 0")
+        lines.append(
+            {
+                "department": department,
+                "team": team,
+                "project": project,
+                "amount_cents": amount_cents,
+                "note": note,
+            }
+        )
+
+    if not lines:
+        raise HTTPException(status_code=400, detail="请至少填写一条分摊明细")
+    totals = claim_totals(conn, payment_id)
+    new_total = sum(line["amount_cents"] for line in lines)
+    if totals["active"] + new_total > payment["amount_cents"]:
+        raise HTTPException(status_code=409, detail="分摊金额合计超过该笔款剩余可认领金额")
+
+    created_claim_ids = []
+    for line in lines:
+        cur = conn.execute(
+            """
+            INSERT INTO claims
+                (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            """,
+            (
+                payment_id,
+                line["department"],
+                line["team"],
+                line["amount_cents"],
+                actor["id"],
+                actor["name"],
+                line["project"],
+                line["note"],
+                now_text(),
+            ),
+        )
+        created_claim_ids.append(cur.lastrowid)
+
+    refresh_payment_claim_status(conn, payment_id)
+    payment_after = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    detail = {
+        "payment_id": payment_id,
+        "claim_ids": created_claim_ids,
+        "count": len(lines),
+        "amount_cents": new_total,
+        "payment_status": payment_after["status"] if payment_after else "",
+    }
+    audit(conn, actor, "split_claim_submit", payment_id, detail, request)
+    return detail
+
+
 @app.get("/search", response_class=HTMLResponse)
 def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLResponse:
     rate_limit(request, "search")
@@ -1798,6 +2072,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
                     <tr>
                       <td class="nowrap">{esc(row["received_date"])}</td>
                       <td class="num">¥ {money(row["amount_cents"])}</td>
+                      <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
                       <td><strong>{esc(row["payer_name"])}</strong></td>
                       <td>{esc(row["bank_note"])}</td>
                       <td>{status_badge(row["status"])}{claim_hint}</td>
@@ -1808,7 +2083,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         result_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>日期</th><th>金额</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
+          <thead><tr><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -1859,9 +2134,11 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
                 f"""
                 <tr>
                   <td class="nowrap">{esc(row["received_date"])}</td>
+                  <td class="num">¥ {money(row["amount_cents"])}</td>
+                  <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
                   <td><strong>{esc(row["payer_name"])}</strong></td>
                   <td>{esc(row["bank_note"])}</td>
-                  <td>{status_badge(row["status"])}{claim_summary_html(conn, row, show_amount=False)}</td>
+                  <td>{status_badge(row["status"])}{claim_summary_html(conn, row)}</td>
                   <td class="actions">{claim_form_html(row, actor)}</td>
                 </tr>
                 """
@@ -1870,7 +2147,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         table_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>日期</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
+          <thead><tr><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -1884,7 +2161,6 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
 
     pending_html = f"""
     <h2>待认领列表</h2>
-    <p class="hint" style="margin:-4px 0 12px">为保护金额信息，列表不显示金额。如需按金额核对，请在上方输入精确金额搜索。</p>
     {filter_form}
     {table_html}
     """
@@ -1904,13 +2180,118 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
           <div><button type="submit">搜索</button></div>
         </div>
       </form>
-      <p class="hint">搜索可看到金额；下方公开列表不显示金额。空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
+      <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
     </div>
     {result_html}
     {pending_html}
     {catalog_script()}
     """
     return page("到款认领搜索", body, active="search", subtitle="输入客户名、金额或备注，找到属于你部门的到款并提交认领", actor=actor)
+
+
+@app.get("/split-claim", response_class=HTMLResponse)
+def split_claim_page(request: Request, q: str = "") -> HTMLResponse:
+    rate_limit(request, "search")
+    actor = actor_from_request(request)
+    if not actor.get("authed"):
+        if feishu_enabled():
+            login_html = '<a href="/login?next=/split-claim" class="login-btn">飞书登录</a>'
+            prompt = "请先通过飞书登录。登录后才能提交分摊认领。"
+        else:
+            login_html = ""
+            prompt = "系统尚未配置飞书登录，请联系管理员配置后再使用分摊认领。"
+        body = f"""
+        <div class="panel">
+          <div class="callout info" style="margin-bottom:0">
+            <strong>分摊认领仅对组织内同事开放</strong><br>
+            {esc(prompt)}
+          </div>
+          {f'<div style="margin-top:14px">{login_html}</div>' if login_html else ''}
+        </div>
+        """
+        return page("分摊认领", body, active="split", subtitle="一笔到款拆分给多个部门、中心和项目", actor=actor)
+
+    q = q.strip()
+    message = ""
+    rows: list[sqlite3.Row] = []
+    if q:
+        id_query = bool(re.fullmatch(r"#?\s*\d+", q))
+        ok, reason = (True, "") if id_query else validate_search_query(q)
+        with get_conn() as conn:
+            if not ok:
+                message = reason
+                audit(conn, actor, "split_search_blocked", None, {"query": q, "reason": reason}, request)
+            else:
+                rows = split_claim_candidates(conn, q)
+                audit(conn, actor, "split_search", None, {"query": q, "result_count": len(rows)}, request)
+
+    result_html = ""
+    if message:
+        result_html = f'<div class="callout warn"><strong>搜索被限制：</strong>{esc(message)}</div>'
+    elif q and not rows:
+        result_html = '<div class="callout info">没有找到可分摊认领的到款。请换客户名、金额、备注或到款 ID 试试。</div>'
+    elif rows:
+        table_rows = []
+        with get_conn() as conn:
+            for row in rows:
+                table_rows.append(
+                    f"""
+                    <tr>
+                      <td class="nowrap">#{row['id']}<br>{esc(row["received_date"])}</td>
+                      <td class="num">¥ {money(row["amount_cents"])}</td>
+                      <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
+                      <td><strong>{esc(row["payer_name"])}</strong><div class="muted">{esc(row["bank_note"])}</div></td>
+                      <td>{status_badge(row["status"])}{claim_summary_html(conn, row)}</td>
+                    </tr>
+                    <tr>
+                      <td colspan="5" class="split-form-cell">{split_claim_form_html(row)}</td>
+                    </tr>
+                    """
+                )
+        result_html = f"""
+        <div class="table-wrap">
+        <table>
+          <thead><tr><th>到款</th><th>金额</th><th>到款公司</th><th>付款方 / 备注</th><th>状态</th></tr></thead>
+          <tbody>{''.join(table_rows)}</tbody>
+        </table>
+        </div>
+        """
+
+    body = f"""
+    <div class="panel">
+      <form method="get" action="/split-claim">
+        <div class="row">
+          <div style="flex:1; min-width:250px">
+            <label>查找到款</label>
+            <input name="q" value="{esc(q)}" placeholder="客户名、金额、备注，或直接输入到款 ID（如 #17）" autofocus>
+          </div>
+          <div><button type="submit">搜索</button></div>
+        </div>
+      </form>
+      <p class="hint">适合一笔到款对应多个产品或多个部门归属的场景。每一行分摊会作为待财务确认的认领记录。</p>
+    </div>
+    {result_html}
+    {catalog_script()}
+    """
+    return page("分摊认领", body, active="split", subtitle="一笔到款拆分给多个部门、中心和项目", actor=actor)
+
+
+@app.post("/split-claim/{payment_id}")
+def submit_split_claim(
+    request: Request,
+    payment_id: int,
+    departments: list[str] = Form([]),
+    teams: list[str] = Form([]),
+    projects: list[str] = Form([]),
+    amounts: list[str] = Form([]),
+    notes: list[str] = Form([]),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    if not actor.get("authed"):
+        raise HTTPException(status_code=403, detail="请先用飞书登录后再提交分摊认领")
+    with get_conn() as conn:
+        submit_split_claims(conn, actor, payment_id, departments, teams, projects, amounts, notes, request)
+    return RedirectResponse(f"/split-claim?q=%23{payment_id}", status_code=303)
 
 
 def validate_search_query(q: str) -> tuple[bool, str]:
@@ -2156,12 +2537,12 @@ def dashboard_period_ranges(today: Optional[date] = None) -> list[tuple[str, dat
 
 
 def dashboard_scope_label(actor: dict[str, str]) -> str:
+    if actor.get("dashboard_scope_label"):
+        return actor["dashboard_scope_label"]
     if actor["role"] in {"finance", "admin", "superadmin"}:
         return "全公司"
-    if actor["role"] == "general_manager":
-        dept = actor.get("department", "")
-        return dept if dept in DEPARTMENTS else "未设置部门"
-    return "我的认领"
+    dept = actor.get("department", "")
+    return dept if dept in DEPARTMENTS else "未设置部门"
 
 
 def dashboard_entries(
@@ -2178,7 +2559,7 @@ def dashboard_entries(
     if actor["role"] in {"finance", "admin", "superadmin"}:
         rows = conn.execute(
             f"""
-            SELECT p.id, p.payer_name, p.bank_note, p.amount_cents, p.claimed_department,
+            SELECT p.id, p.payer_name, p.bank_note, p.receiver_company, p.amount_cents, p.claimed_department,
                    c.department AS claim_department, c.amount_cents AS claim_amount
             FROM payments p
             LEFT JOIN claims c
@@ -2197,6 +2578,7 @@ def dashboard_entries(
                 {
                     "payer_name": row["payer_name"] or "未填写付款方",
                     "bank_note": row["bank_note"] or "",
+                    "receiver_company": row["receiver_company"] or "",
                     "amount_cents": row["amount_cents"] or 0,
                     "claimed_department": row["claimed_department"] or "",
                     "claims": [],
@@ -2222,6 +2604,7 @@ def dashboard_entries(
                     {
                         "payer_name": payment["payer_name"],
                         "bank_note": payment["bank_note"],
+                        "receiver_company": payment["receiver_company"],
                         "department": claim["department"] or "未认领",
                         "amount_cents": amount,
                     }
@@ -2233,33 +2616,53 @@ def dashboard_entries(
                     {
                         "payer_name": payment["payer_name"],
                         "bank_note": payment["bank_note"],
+                        "receiver_company": payment["receiver_company"],
                         "department": department or "未认领",
                         "amount_cents": remaining,
                     }
                 )
         return entries
 
-    where_extra = ""
-    params: list[Any] = [*active_claim_statuses, start_text, end_text, *visible_statuses]
-    if actor["role"] == "general_manager":
+    raw_scopes = actor.get("dashboard_scopes")
+    scopes = raw_scopes if isinstance(raw_scopes, list) else []
+    if not scopes:
         department = actor.get("department", "")
+        if department in DEPARTMENTS:
+            scopes = [{"department": department, "team": actor.get("team", "")}]
+    clauses = []
+    scope_params: list[Any] = []
+    seen_scope_keys: set[tuple[str, str]] = set()
+    for scope in scopes:
+        department = str(scope.get("department", "")).strip() if isinstance(scope, dict) else ""
+        team = str(scope.get("team", "")).strip() if isinstance(scope, dict) else ""
         if department not in DEPARTMENTS:
-            return []
-        where_extra = " AND c.department = ?"
-        params.append(department)
-    else:
-        where_extra = " AND c.actor_id = ?"
-        params.append(actor["id"])
+            continue
+        if team and team not in CATALOG.get(department, {}):
+            continue
+        scope_key = (department, team)
+        if scope_key in seen_scope_keys:
+            continue
+        seen_scope_keys.add(scope_key)
+        if team:
+            clauses.append("(c.department = ? AND c.team = ?)")
+            scope_params.extend([department, team])
+        else:
+            clauses.append("c.department = ?")
+            scope_params.append(department)
+    if not clauses:
+        return []
+    scope_where = " OR ".join(clauses)
+    params: list[Any] = [*active_claim_statuses, start_text, end_text, *visible_statuses, *scope_params]
 
     rows = conn.execute(
         f"""
-        SELECT p.payer_name, p.bank_note, c.department, c.amount_cents
+        SELECT p.payer_name, p.bank_note, p.receiver_company, c.department, c.amount_cents
         FROM claims c
         JOIN payments p ON p.id = c.payment_id
         WHERE c.status IN ({",".join("?" for _ in active_claim_statuses)})
           AND p.received_date BETWEEN ? AND ?
           AND p.status IN ({",".join("?" for _ in visible_statuses)})
-          {where_extra}
+          AND ({scope_where})
         ORDER BY c.id DESC
         """,
         params,
@@ -2268,6 +2671,7 @@ def dashboard_entries(
         {
             "payer_name": row["payer_name"] or "未填写付款方",
             "bank_note": row["bank_note"] or "",
+            "receiver_company": row["receiver_company"] or "",
             "department": row["department"] or "未认领",
             "amount_cents": row["amount_cents"] or 0,
         }
@@ -2288,6 +2692,7 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
         total += amount
         payer_name = str(entry.get("payer_name") or "未填写付款方")
         bank_note = str(entry.get("bank_note") or "")
+        receiver_company = str(entry.get("receiver_company") or "")
         department = str(entry.get("department") or "未认领")
         customers[payer_name] = customers.get(payer_name, 0) + amount
         departments[department] = departments.get(department, 0) + amount
@@ -2295,6 +2700,7 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
             {
                 "payer_name": payer_name,
                 "bank_note": bank_note,
+                "receiver_company": receiver_company,
                 "department": department,
                 "amount_cents": amount,
             }
@@ -2340,6 +2746,7 @@ def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
         f"""
         <tr>
           <td>{esc(row["payer_name"])}</td>
+          <td>{esc(receiver_company_label(row.get("receiver_company")))}</td>
           <td>{esc(row.get("bank_note") or "")}</td>
           <td>{esc(row["department"])}</td>
           <td class="num">¥ {money(row["amount_cents"])}</td>
@@ -2351,19 +2758,46 @@ def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
     <div class="dash-table-wrap">
       <table class="dash-table">
         <colgroup>
-          <col style="width:30%">
-          <col style="width:34%">
-          <col style="width:24%">
+          <col style="width:28%">
+          <col style="width:20%">
+          <col style="width:26%">
+          <col style="width:14%">
           <col style="width:12%">
         </colgroup>
-        <thead><tr><th>付款客户</th><th>摘要</th><th>款项所属部门</th><th>金额</th></tr></thead>
+        <thead><tr><th>付款客户</th><th>到款公司</th><th>摘要</th><th>款项所属部门</th><th>金额</th></tr></thead>
         <tbody>{body}</tbody>
       </table>
     </div>
     """
 
 
-def render_personal_dashboard(actor: dict[str, str], dashboard: list[dict[str, Any]]) -> str:
+def render_dashboard_scope_selector(
+    choices: list[dict[str, Any]],
+    selected_key: str,
+    show: bool = True,
+) -> str:
+    if not show:
+        return ""
+    options = "".join(
+        f'<option value="{esc(choice["key"])}"{" selected" if choice["key"] == selected_key else ""}>{esc(choice["label"])}</option>'
+        for choice in choices
+    )
+    return f"""
+    <form method="get" action="/me" class="row" style="align-items:end; margin:-2px 0 14px">
+      <div style="min-width:220px">
+        <label>当前查看范围</label>
+        <select name="scope" onchange="this.form.submit()">{options}</select>
+      </div>
+      <div><button class="secondary" type="submit">切换</button></div>
+    </form>
+    """
+
+
+def render_personal_dashboard(
+    actor: dict[str, str],
+    dashboard: list[dict[str, Any]],
+    scope_selector: str = "",
+) -> str:
     cards = []
     for item in dashboard:
         date_range = item["start"].strftime("%Y-%m-%d")
@@ -2386,6 +2820,7 @@ def render_personal_dashboard(actor: dict[str, str], dashboard: list[dict[str, A
     return f"""
     <h2>数据看板</h2>
     <p class="hint" style="margin:-4px 0 12px">当前范围：{esc(dashboard_scope_label(actor))}</p>
+    {scope_selector}
     <div class="dash-grid">{''.join(cards)}</div>
     """
 
@@ -2440,16 +2875,27 @@ def diagnostic_log_html(actor: dict[str, str], cur_dept: str, cur_team: str) -> 
 
 
 @app.get("/me", response_class=HTMLResponse)
-def personal_center(request: Request) -> HTMLResponse:
+def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
     actor = actor_from_request(request)
     with get_conn() as conn:
-        dashboard = personal_dashboard_data(conn, actor)
+        extra_scopes = get_user_scopes(conn, actor["id"]) if actor.get("authed") else []
+        scope_choices = dashboard_scope_choices(actor, extra_scopes)
+        selected_scope = next((choice for choice in scope_choices if choice["key"] == scope), scope_choices[0])
+        dashboard_actor = {
+            **actor,
+            "dashboard_scopes": selected_scope["scopes"],
+            "dashboard_scope_label": selected_scope["label"],
+        }
+        if actor["role"] in {"finance", "admin", "superadmin"}:
+            dashboard_actor = actor
+            selected_scope = scope_choices[0]
+        dashboard = personal_dashboard_data(conn, dashboard_actor)
         my_claims = conn.execute(
             """
             SELECT c.id AS c_id, c.department AS c_dept, c.team AS c_team,
                    c.customer_project AS c_proj, c.amount_cents AS c_amount,
                    c.created_at AS c_at, c.status AS c_status,
-                   p.received_date, p.payer_name, p.bank_note, p.status AS p_status,
+                   p.received_date, p.payer_name, p.receiver_company, p.bank_note, p.status AS p_status,
                    p.claimed_by, p.claimed_by_name
             FROM claims c
             JOIN payments p ON p.id = c.payment_id
@@ -2493,6 +2939,11 @@ def personal_center(request: Request) -> HTMLResponse:
     """
 
     profile_modal = profile_setup_modal_html(actor, cur_dept, cur_team)
+    scope_selector = render_dashboard_scope_selector(
+        scope_choices,
+        selected_scope["key"],
+        show=actor["role"] not in {"finance", "admin", "superadmin"},
+    )
 
     if my_claims:
         rows = []
@@ -2501,6 +2952,8 @@ def personal_center(request: Request) -> HTMLResponse:
                 state = '<span class="status claimed">已确认</span>'
             elif r["c_status"] == "pending":
                 state = status_badge("pending_confirm")
+            elif r["c_status"] == "canceled":
+                state = status_badge("canceled")
             elif r["c_status"] == "rejected":
                 state = status_badge("rejected")
             elif r["p_status"] == "rejected":
@@ -2509,21 +2962,33 @@ def personal_center(request: Request) -> HTMLResponse:
                 state = f'<span class="status rejected">已归他人</span><div class="muted">{esc(r["claimed_by_name"] or "")}</div>'
             else:
                 state = status_badge(r["p_status"])
+            cancel_action = ""
+            if actor.get("authed") and r["c_status"] in {"pending", "accepted"}:
+                cancel_action = f"""
+                <form method="post" action="/me/claims/{r['c_id']}/cancel" style="margin-top:10px"
+                      onsubmit="return confirm('确定取消这条认领吗？取消后这笔款会回到待认领列表。')">
+                  <button class="danger" type="submit">取消认领</button>
+                </form>
+                """
             rows.append(
                 f"""
                 <tr>
                   <td class="nowrap">{esc(r["received_date"])}</td>
-                  <td><strong>{esc(r["payer_name"])}</strong><div class="muted">{esc(r["bank_note"])}</div></td>
+                  <td>
+                    <strong>{esc(r["payer_name"])}</strong>
+                    <div class="muted">到款公司：{esc(receiver_company_label(r["receiver_company"]))}</div>
+                    <div class="muted">{esc(r["bank_note"])}</div>
+                  </td>
                   <td>{esc(r["c_dept"])}<div class="muted">{esc(r["c_team"])} · {esc(r["c_proj"])} · ¥ {money(r["c_amount"])}</div></td>
                   <td class="nowrap muted">{esc(r["c_at"])}</td>
-                  <td>{state}</td>
+                  <td>{state}{cancel_action}</td>
                 </tr>
                 """
             )
         claims_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>到款日期</th><th>付款方 / 备注</th><th>部门 / 中心 / 项目</th><th>提交时间</th><th>当前状态</th></tr></thead>
+          <thead><tr><th>到款日期</th><th>付款方 / 到款公司 / 备注</th><th>部门 / 中心 / 项目</th><th>提交时间</th><th>当前状态</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -2534,13 +2999,23 @@ def personal_center(request: Request) -> HTMLResponse:
     body = f"""
     {identity_card}
     {profile_modal}
-    {render_personal_dashboard(actor, dashboard)}
+    {render_personal_dashboard(dashboard_actor, dashboard, scope_selector)}
     <h2>我的认领</h2>
     {claims_html}
     {diagnostic_log_html(actor, cur_dept, cur_team)}
     {personal_script()}
     """
     return page("个人中心", body, active="me", subtitle="查看你的身份信息和认领记录", actor=actor)
+
+
+@app.post("/me/claims/{claim_id}/cancel")
+def cancel_my_claim_route(request: Request, claim_id: int) -> RedirectResponse:
+    actor = actor_from_request(request)
+    if not actor.get("authed"):
+        raise HTTPException(status_code=403, detail="请先用飞书登录")
+    with get_conn() as conn:
+        cancel_my_claim(conn, actor, claim_id, request)
+    return RedirectResponse("/me", status_code=303)
 
 
 @app.post("/me/profile")
@@ -2596,6 +3071,76 @@ def admin_set_profile(
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="成员不存在")
         audit(conn, actor, "admin_set_profile", None, {"open_id": open_id, "department": department, "team": team}, request)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/scopes/{open_id}/add")
+def admin_add_user_scope(
+    request: Request,
+    open_id: str,
+    department: str = Form(...),
+    team: str = Form(""),
+    label: str = Form(""),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    department = require_department(department)
+    team = team.strip()
+    label = label.strip()
+    if team and team not in CATALOG.get(department, {}):
+        raise HTTPException(status_code=400, detail="请选择该部门下的中心/小组")
+    with get_conn() as conn:
+        profile = conn.execute("SELECT open_id FROM user_profiles WHERE open_id = ?", (open_id,)).fetchone()
+        if not profile:
+            raise HTTPException(status_code=404, detail="成员不存在")
+        existing = conn.execute(
+            """
+            SELECT id FROM user_scopes
+            WHERE open_id = ? AND department = ? AND COALESCE(team, '') = ? AND active = 1
+            """,
+            (open_id, department, team),
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="该成员已有这个参与范围")
+        conn.execute(
+            """
+            INSERT INTO user_scopes
+                (open_id, department, team, label, active, created_at, created_by, created_by_name)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (open_id, department, team, label, now_text(), actor["id"], actor["name"]),
+        )
+        audit(
+            conn,
+            actor,
+            "add_user_scope",
+            None,
+            {"open_id": open_id, "department": department, "team": team, "label": label},
+            request,
+        )
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/scopes/{scope_id}/deactivate")
+def admin_deactivate_user_scope(request: Request, scope_id: int) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM user_scopes WHERE id = ?", (scope_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="参与范围不存在")
+        conn.execute(
+            "UPDATE user_scopes SET active = 0 WHERE id = ?",
+            (scope_id,),
+        )
+        audit(
+            conn,
+            actor,
+            "deactivate_user_scope",
+            None,
+            {"scope_id": scope_id, "open_id": row["open_id"], "department": row["department"], "team": row["team"] or ""},
+            request,
+        )
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -2657,7 +3202,7 @@ def export_today_payments(request: Request) -> Response:
         rows = conn.execute(
             """
             SELECT id, received_date, received_time, payer_name, amount_cents, bank_note,
-                   receiver_account, serial_no, status, claimed_department, claimed_team,
+                   receiver_company, receiver_account, serial_no, status, claimed_department, claimed_team,
                    customer_project, claimed_by_name, claimed_at, claim_note, finance_note,
                    source_ref, imported_at, confirmed_at
             FROM payments
@@ -2677,6 +3222,7 @@ def export_today_payments(request: Request) -> Response:
             "到款日期",
             "到款时间",
             "付款方",
+            "到款公司",
             "到款金额",
             "认领金额",
             "银行备注",
@@ -2712,6 +3258,7 @@ def export_today_payments(request: Request) -> Response:
                     row["received_date"],
                     row["received_time"],
                     row["payer_name"],
+                    row["receiver_company"],
                     money(row["amount_cents"]),
                     money(claim["amount_cents"]) if claim else "",
                     row["bank_note"],
@@ -2868,11 +3415,12 @@ def render_payment_pool_html(
         {admin_sort_th("ID", "id", sort, direction)}
         {admin_sort_th("日期", "date", sort, direction)}
         {admin_sort_th("金额", "amount", sort, direction)}
+        <th>到款公司</th>
         {admin_sort_th("付款方 / 摘要", "payer", sort, direction)}
         {admin_sort_th("状态 / 认领", "status", sort, direction)}
         <th style="width:320px">管理操作</th>
       </tr></thead>
-      <tbody>{payment_rows or '<tr><td colspan="7" class="empty">暂无记录</td></tr>'}</tbody>
+      <tbody>{payment_rows or '<tr><td colspan="8" class="empty">暂无记录</td></tr>'}</tbody>
     </table>
     </div>
     """
@@ -2916,6 +3464,9 @@ def admin_page(
         profiles = conn.execute(
             "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
         ).fetchall()
+        scope_rows = conn.execute(
+            "SELECT * FROM user_scopes WHERE active = 1 ORDER BY open_id, id DESC"
+        ).fetchall()
         app_user_rows = (
             conn.execute(
                 """
@@ -2933,6 +3484,10 @@ def admin_page(
             if actor["role"] == "superadmin"
             else []
         )
+
+    user_scopes_by_open_id: dict[str, list[sqlite3.Row]] = {}
+    for scope_row in scope_rows:
+        user_scopes_by_open_id.setdefault(scope_row["open_id"], []).append(scope_row)
 
     stat_map = {row["status"]: row for row in stats}
     stat_html = "".join(
@@ -2970,8 +3525,23 @@ def admin_page(
         f"<tr><td class='nowrap'>{esc(row['at'])}</td><td class='nowrap'>{esc(row['actor_name'])}</td><td class='nowrap'>{esc(row['action'])}</td><td>{esc(row['payment_id'])}</td><td><span class='code'>{esc(row['detail_json'])}</span></td></tr>"
         for row in logs
     )
-    profile_rows = "".join(
-        f"""
+    profile_parts = []
+    for p in profiles:
+        user_scope_rows = user_scopes_by_open_id.get(p["open_id"], [])
+        scope_badges = "".join(
+            f"""
+            <div class="muted" style="margin-top:6px">
+              参与范围：{esc(scope_display_label(row["department"], row["team"] or "", row["label"] or ""))}
+              <form method="post" action="/admin/scopes/{row['id']}/deactivate" style="display:inline" onsubmit="return confirm('确定停用这个参与范围吗？')">
+                {finance_hidden(actor)}
+                <button class="secondary" type="submit" style="padding:3px 8px; margin-left:6px; font-size:12px">停用</button>
+              </form>
+            </div>
+            """
+            for row in user_scope_rows
+        )
+        profile_parts.append(
+            f"""
         <tr>
           <td><strong>{esc(p["name"] or "")}</strong><br><span class="code">{esc(p["open_id"])}</span></td>
           <td class="actions">
@@ -2981,12 +3551,20 @@ def admin_page(
               <div style="min-width:170px; flex:1"><label>中心 / 小组</label>{team_select("team", p["department"] or "", p["team"] or "", required=True)}</div>
               <div><button class="secondary" type="submit">保存</button></div>
             </form>
+            {scope_badges}
+            <form method="post" action="/admin/scopes/{esc(p['open_id'])}/add" class="row" style="align-items:end; margin-top:10px; border-top:1px dashed var(--line); padding-top:10px">
+              {finance_hidden(actor)}
+              <div style="min-width:170px; flex:1"><label>新增参与部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
+              <div style="min-width:170px; flex:1"><label>中心 / 小组（可选）</label>{team_select("team", "", required=False)}</div>
+              <div style="min-width:180px; flex:1"><label>显示名称（可选）</label><input name="label" placeholder="如：年会报名组"></div>
+              <div><button class="secondary" type="submit">添加参与范围</button></div>
+            </form>
           </td>
           <td class="nowrap muted">{esc(p["updated_at"])}</td>
         </tr>
         """
-        for p in profiles
-    )
+        )
+    profile_rows = "".join(profile_parts)
 
     # 管理员管理（仅超级管理员可见）
     admin_section = ""
@@ -3054,7 +3632,7 @@ def admin_page(
         <p class="hint">可上传 PDF、.xls 或 .xlsx 文件；Excel 会自动读取所有非空工作表。</p>
         <div class="field">
           <label>CSV / TSV / 表格文本</label>
-          <textarea name="table_text" placeholder="到款日期,付款方名称,到款金额,银行备注,流水号"></textarea>
+          <textarea name="table_text" placeholder="到款日期,付款方名称,到款公司,到款金额,银行备注,流水号"></textarea>
         </div>
         <button type="submit">导入为待确认</button>
       </form>
@@ -3234,6 +3812,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
       <td class="nowrap">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
       <td class="nowrap">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
       <td class="num">¥ {money(row['amount_cents'])}</td>
+      <td>{esc(receiver_company_label(row['receiver_company']))}</td>
       <td class="payment-summary">
         <strong>{esc(row['payer_name'])}</strong>
         <div>{esc(row['bank_note'])}</div>
@@ -3249,6 +3828,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
                 <div style="width:115px"><label>日期</label><input name="received_date" value="{esc(row['received_date'])}"></div>
                 <div style="width:110px"><label>金额</label><input name="amount" value="{money(row['amount_cents']).replace(',', '')}"></div>
               </div>
+              <div class="field" style="margin-top:10px"><label>到款公司</label><input name="receiver_company" value="{esc(row['receiver_company'])}"></div>
               <div class="field" style="margin-top:10px"><label>付款方</label><input name="payer_name" value="{esc(row['payer_name'])}"></div>
               <div class="field"><label>备注</label><input name="bank_note" value="{esc(row['bank_note'])}"></div>
               <button class="secondary" type="submit">保存字段</button>
@@ -3349,8 +3929,8 @@ def admin_import(
                 """
                 INSERT INTO payments
                     (batch_id, imported_at, received_date, received_time, payer_name, amount_cents,
-                     bank_note, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                     bank_note, receiver_company, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
                 """,
                 (
                     batch_id,
@@ -3360,6 +3940,7 @@ def admin_import(
                     payer_name,
                     max(amount_cents, 0),
                     item.get("bank_note", "").strip(),
+                    item.get("receiver_company", "").strip(),
                     item.get("receiver_account", "").strip(),
                     item.get("serial_no", "").strip(),
                     source_ref,
@@ -3555,6 +4136,35 @@ def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> N
         )
 
 
+def cancel_my_claim(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    claim_id: int,
+    request: Optional[Request] = None,
+) -> dict[str, Any]:
+    claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+    if not claim:
+        raise HTTPException(status_code=404, detail="认领记录不存在")
+    if claim["actor_id"] != actor["id"]:
+        raise HTTPException(status_code=403, detail="只能取消自己的认领")
+    if claim["status"] not in {"pending", "accepted"}:
+        raise HTTPException(status_code=409, detail="这条认领当前不能取消")
+
+    payment_id = int(claim["payment_id"])
+    conn.execute("UPDATE claims SET status = 'canceled' WHERE id = ?", (claim_id,))
+    refresh_payment_claim_status(conn, payment_id)
+    payment = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    detail = {
+        "claim_id": claim_id,
+        "payment_id": payment_id,
+        "previous_status": claim["status"],
+        "payment_status": payment["status"] if payment else "",
+        "amount_cents": claim["amount_cents"],
+    }
+    audit(conn, actor, "cancel_my_claim", payment_id, detail, request)
+    return detail
+
+
 def accept_payment_claims(
     conn: sqlite3.Connection,
     actor: dict[str, str],
@@ -3680,6 +4290,7 @@ def edit_payment(
     payment_id: int,
     received_date: str = Form(""),
     amount: str = Form(""),
+    receiver_company: str = Form(""),
     payer_name: str = Form(""),
     bank_note: str = Form(""),
 ) -> RedirectResponse:
@@ -3690,12 +4301,26 @@ def edit_payment(
         conn.execute(
             """
             UPDATE payments
-            SET received_date = ?, amount_cents = ?, payer_name = ?, bank_note = ?
+            SET received_date = ?, amount_cents = ?, receiver_company = ?, payer_name = ?, bank_note = ?
             WHERE id = ?
             """,
-            (parse_date(received_date), parse_amount(amount), payer_name.strip(), bank_note.strip(), payment_id),
+            (
+                parse_date(received_date),
+                parse_amount(amount),
+                receiver_company.strip(),
+                payer_name.strip(),
+                bank_note.strip(),
+                payment_id,
+            ),
         )
-        audit(conn, actor, "edit_payment", payment_id, {"received_date": received_date, "amount": amount}, request)
+        audit(
+            conn,
+            actor,
+            "edit_payment",
+            payment_id,
+            {"received_date": received_date, "amount": amount, "receiver_company": receiver_company.strip()},
+            request,
+        )
     return RedirectResponse("/admin", status_code=303)
 
 

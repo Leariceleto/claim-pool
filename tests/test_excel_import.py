@@ -143,6 +143,20 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["amount"], "1980")
 
+    def test_receiver_company_header_imports(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["到款日期", "付款方名称", "到款公司", "到款金额", "银行备注"])
+        sheet.append(["2026-06-25", "深圳测试学校", "北京蒲公英教育科技有限公司", 3980, "参会费"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "receiver_company.xlsx"
+            workbook.save(path)
+            rows = self.app.rows_from_excel(path)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["receiver_company"], "北京蒲公英教育科技有限公司")
+
     def test_bulk_close_payments_skips_closed_and_logs(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -257,6 +271,229 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(payment["finance_note"], "部分认领已确认完成")
         self.assertEqual(audit_row["action"], "accept_payment_claims")
 
+    def test_cancel_my_claim_returns_payment_to_pending(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                776000,
+                "claimed",
+                "中国教育创新年会事业部",
+                "创新年会",
+                "user-a",
+                "测试用户",
+                "2026-07-01 11:09:00",
+                "报名费",
+                "",
+                "",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, status) VALUES (?, ?, ?, ?, ?)",
+            (1, 1, 776000, "user-a", "accepted"),
+        )
+        actor = {"id": "user-a", "name": "测试用户", "role": "claimant"}
+
+        detail = self.app.cancel_my_claim(conn, actor, 1)
+
+        payment = conn.execute("SELECT status, claimed_by, claimed_department FROM payments WHERE id = 1").fetchone()
+        claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
+        audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["payment_status"], "pending")
+        self.assertEqual(claim["status"], "canceled")
+        self.assertEqual(payment["status"], "pending")
+        self.assertIsNone(payment["claimed_by"])
+        self.assertIsNone(payment["claimed_department"])
+        self.assertEqual(audit_row["action"], "cancel_my_claim")
+
+    def test_cancel_my_claim_rejects_other_users_claim(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (1, 10000, "pending_confirm"),
+        )
+        conn.execute(
+            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, status) VALUES (?, ?, ?, ?, ?)",
+            (1, 1, 10000, "user-a", "pending"),
+        )
+
+        with self.assertRaises(self.app.HTTPException) as ctx:
+            self.app.cancel_my_claim(conn, {"id": "user-b", "name": "其他用户", "role": "claimant"}, 1)
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
+        self.assertEqual(claim["status"], "pending")
+
+    def test_submit_split_claims_creates_pending_lines_and_refreshes_payment(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                team TEXT,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                customer_project TEXT,
+                contract_invoice TEXT,
+                note TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        department = self.app.DEPARTMENTS[0]
+        team = next(iter(self.app.CATALOG[department]))
+        projects = self.app.CATALOG[department][team][:2]
+        if len(projects) < 2:
+            projects = [projects[0], projects[0]]
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (1, 10000, "pending"),
+        )
+        actor = {"id": "split-user", "name": "分摊同事", "role": "claimant"}
+
+        detail = self.app.submit_split_claims(
+            conn,
+            actor,
+            1,
+            [department, department],
+            [team, team],
+            [projects[0], projects[1]],
+            ["60", "40"],
+            ["2本杂志", "2个参会名额"],
+        )
+
+        payment = conn.execute("SELECT status, finance_note FROM payments WHERE id = 1").fetchone()
+        claim_rows = conn.execute("SELECT amount_cents, status, note FROM claims ORDER BY id").fetchall()
+        audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["count"], 2)
+        self.assertEqual(detail["amount_cents"], 10000)
+        self.assertEqual(detail["payment_status"], "pending_confirm")
+        self.assertEqual(payment["status"], "pending_confirm")
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款，待管理员确认")
+        self.assertEqual([row["amount_cents"] for row in claim_rows], [6000, 4000])
+        self.assertEqual([row["status"] for row in claim_rows], ["pending", "pending"])
+        self.assertEqual([row["note"] for row in claim_rows], ["2本杂志", "2个参会名额"])
+        self.assertEqual(audit_row["action"], "split_claim_submit")
+
     def test_admin_payment_sort_clause_is_whitelisted(self) -> None:
         clause, sort, direction = self.app.admin_payment_order_clause("amount", "asc")
         self.assertEqual(sort, "amount")
@@ -317,6 +554,7 @@ class ExcelImportTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY,
                 received_date TEXT,
                 payer_name TEXT,
+                receiver_company TEXT,
                 bank_note TEXT,
                 amount_cents INTEGER NOT NULL,
                 claimed_department TEXT,
@@ -334,14 +572,14 @@ class ExcelImportTests(unittest.TestCase):
         )
         conn.executemany(
             """
-            INSERT INTO payments (id, received_date, payer_name, bank_note, amount_cents, claimed_department, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO payments (id, received_date, payer_name, receiver_company, bank_note, amount_cents, claimed_department, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, "2026-06-25", "未认领客户", "测试摘要1", 10000, "", "pending"),
-                (2, "2026-06-25", "年会客户A", "测试摘要2", 20000, "年会事业部", "claimed"),
-                (3, "2026-06-25", "混合客户", "测试摘要3", 30000, "", "pending_confirm"),
-                (4, "2026-06-25", "关闭客户", "测试摘要4", 99900, "", "closed"),
+                (1, "2026-06-25", "未认领客户", "蒲公英教育科技", "测试摘要1", 10000, "", "pending"),
+                (2, "2026-06-25", "年会客户A", "蒲公英智库", "测试摘要2", 20000, "年会事业部", "claimed"),
+                (3, "2026-06-25", "混合客户", "蒲公英教育科技", "测试摘要3", 30000, "", "pending_confirm"),
+                (4, "2026-06-25", "关闭客户", "蒲公英教育科技", "测试摘要4", 99900, "", "closed"),
             ],
         )
         department = self.app.DEPARTMENTS[0]
@@ -367,9 +605,23 @@ class ExcelImportTests(unittest.TestCase):
             {"id": "gm", "role": "general_manager", "department": department},
             today,
         )[0]
-        user_dashboard = self.app.personal_dashboard_data(
+        user_department_dashboard = self.app.personal_dashboard_data(
             conn,
             {"id": "user-b", "role": "claimant", "department": department},
+            today,
+        )[0]
+        user_all_dashboard = self.app.personal_dashboard_data(
+            conn,
+            {
+                "id": "user-b",
+                "role": "claimant",
+                "department": department,
+                "dashboard_scope_label": "全部角色",
+                "dashboard_scopes": [
+                    {"department": department, "team": ""},
+                    {"department": other_department, "team": ""},
+                ],
+            },
             today,
         )[0]
 
@@ -379,9 +631,15 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn((other_department, 18000), admin_dashboard["departments"])
         self.assertEqual(gm_dashboard["total_cents"], 32000)
         self.assertEqual(gm_dashboard["departments"], [(department, 32000)])
-        self.assertEqual(user_dashboard["total_cents"], 12000)
-        self.assertEqual(user_dashboard["customers"], [("混合客户", 12000)])
-        self.assertEqual(user_dashboard["rows"][0]["bank_note"], "测试摘要3")
+        self.assertEqual(user_department_dashboard["total_cents"], 32000)
+        self.assertEqual(user_department_dashboard["departments"], [(department, 32000)])
+        self.assertIn(("混合客户", 12000), user_department_dashboard["customers"])
+        self.assertIn(("年会客户A", 20000), user_department_dashboard["customers"])
+        self.assertTrue(all(row["department"] == department for row in user_department_dashboard["rows"]))
+        self.assertFalse(any(row["department"] == other_department for row in user_department_dashboard["rows"]))
+        self.assertEqual(user_all_dashboard["total_cents"], 50000)
+        self.assertIn((department, 32000), user_all_dashboard["departments"])
+        self.assertIn((other_department, 18000), user_all_dashboard["departments"])
 
     def test_profile_setup_modal_only_for_authed_users_without_complete_profile(self) -> None:
         actor = {"id": "u1", "name": "测试用户", "role": "claimant", "authed": "1"}
