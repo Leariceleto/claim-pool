@@ -882,6 +882,22 @@ BASE_CSS = """
       padding:12px 16px; border-bottom:1px solid var(--line); background:#fbfcfe; }
     .bulk-bar form { display:flex; align-items:center; gap:10px; margin:0; }
     .bulk-count { color:var(--muted); font-size:12.5px; }
+    .admin-payment-table { table-layout:fixed; min-width:1080px; }
+    .admin-payment-table th, .admin-payment-table td { padding:12px 10px; }
+    .admin-payment-table .col-select { width:40px; }
+    .admin-payment-table .col-id { width:72px; }
+    .admin-payment-table .col-date { width:112px; }
+    .admin-payment-table .col-amount { width:126px; }
+    .admin-payment-table .col-receiver { width:130px; }
+    .admin-payment-table .col-status { width:190px; }
+    .admin-payment-table .col-actions { width:218px; }
+    .admin-payment-table .payment-summary { min-width:0; }
+    .admin-payment-table td { overflow-wrap:anywhere; }
+    .admin-payment-table .actions { min-width:0; }
+    .admin-actions details.fold summary { padding:8px 10px; }
+    .admin-actions button { width:100%; padding-left:10px; padding-right:10px; }
+    .admin-actions .edit-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .admin-actions .edit-row > div { width:auto !important; min-width:0; }
     .dash-grid { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:20px; }
     .dash-panel { margin-bottom:0; padding:16px; }
     .dash-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:14px; }
@@ -3355,7 +3371,7 @@ def admin_payment_order_clause(sort: str, direction: str) -> tuple[str, str, str
     return clauses[sort], sort, direction
 
 
-def admin_sort_th(label: str, key: str, current_sort: str, current_dir: str) -> str:
+def admin_sort_th(label: str, key: str, current_sort: str, current_dir: str, class_name: str = "") -> str:
     is_active = key == current_sort
     next_dir = "asc"
     arrow = ""
@@ -3365,8 +3381,9 @@ def admin_sort_th(label: str, key: str, current_sort: str, current_dir: str) -> 
     href = "/admin?" + urlencode({"sort": key, "dir": next_dir})
     table_url = "/admin/payments/table?" + urlencode({"sort": key, "dir": next_dir})
     active_class = " active" if is_active else ""
+    class_attr = f' class="{esc(class_name)}"' if class_name else ""
     return (
-        f'<th><a class="sort-link{active_class}" href="{esc(href)}" '
+        f'<th{class_attr}><a class="sort-link{active_class}" href="{esc(href)}" '
         f'data-table-url="{esc(table_url)}">{esc(label)}{arrow}</a></th>'
     )
 
@@ -3409,16 +3426,16 @@ def render_payment_pool_html(
       </form>
       <span class="muted">关闭不会删除流水、附件或认领记录。</span>
     </div>
-    <table>
+    <table class="admin-payment-table">
       <thead><tr>
-        <th class="select-cell"><input id="bulk-select-all" type="checkbox" aria-label="全选当前页"></th>
-        {admin_sort_th("ID", "id", sort, direction)}
-        {admin_sort_th("日期", "date", sort, direction)}
-        {admin_sort_th("金额", "amount", sort, direction)}
-        <th>到款公司</th>
+        <th class="select-cell col-select"><input id="bulk-select-all" type="checkbox" aria-label="全选当前页"></th>
+        {admin_sort_th("ID", "id", sort, direction, "col-id")}
+        {admin_sort_th("日期", "date", sort, direction, "col-date")}
+        {admin_sort_th("金额", "amount", sort, direction, "col-amount")}
+        <th class="col-receiver">到款公司</th>
         {admin_sort_th("付款方 / 摘要", "payer", sort, direction)}
-        {admin_sort_th("状态 / 认领", "status", sort, direction)}
-        <th style="width:320px">管理操作</th>
+        {admin_sort_th("状态 / 认领", "status", sort, direction, "col-status")}
+        <th class="col-actions">管理操作</th>
       </tr></thead>
       <tbody>{payment_rows or '<tr><td colspan="8" class="empty">暂无记录</td></tr>'}</tbody>
     </table>
@@ -3808,23 +3825,23 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
         """
     return f"""
     <tr>
-      <td class="select-cell"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row['id']}" aria-label="选择流水 #{row['id']}" {'disabled' if row['status'] == 'closed' else ''}></td>
-      <td class="nowrap">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
-      <td class="nowrap">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
-      <td class="num">¥ {money(row['amount_cents'])}</td>
-      <td>{esc(receiver_company_label(row['receiver_company']))}</td>
+      <td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row['id']}" aria-label="选择流水 #{row['id']}" {'disabled' if row['status'] == 'closed' else ''}></td>
+      <td class="nowrap col-id">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
+      <td class="nowrap col-date">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
+      <td class="num col-amount">¥ {money(row['amount_cents'])}</td>
+      <td class="col-receiver">{esc(receiver_company_label(row['receiver_company']))}</td>
       <td class="payment-summary">
         <strong>{esc(row['payer_name'])}</strong>
         <div>{esc(row['bank_note'])}</div>
       </td>
-      <td>{status_badge(row['status'])}{claimed}{finance_note}</td>
-      <td class="actions">
+      <td class="col-status">{status_badge(row['status'])}{claimed}{finance_note}</td>
+      <td class="actions admin-actions col-actions">
         <details class="fold">
           <summary>编辑字段</summary>
           <div class="fold-body">
             <form method="post" action="/admin/payments/{row['id']}/edit">
               {finance_hidden(actor)}
-              <div class="row">
+              <div class="edit-row">
                 <div style="width:115px"><label>日期</label><input name="received_date" value="{esc(row['received_date'])}"></div>
                 <div style="width:110px"><label>金额</label><input name="amount" value="{money(row['amount_cents']).replace(',', '')}"></div>
               </div>
