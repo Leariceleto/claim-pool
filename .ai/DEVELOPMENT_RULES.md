@@ -14,7 +14,7 @@
 - 鉴权函数 `require_xxx`；身份获取 `actor_from_request` / `actor_from_form`。
 - 飞书相关函数前缀 `feishu_`。
 - 数据库字段 snake_case；金额一律存「分」（`amount_cents`），展示用 `money()` 格式化。
-- 角色字符串固定为 `claimant` / `admin` / `finance`(历史兼容) / `superadmin`。`finance` 是早期遗留、与 `admin` 等价，`require_admin` 同时接受，新代码用 `admin`。
+- 角色字符串固定为 `claimant` / `general_manager` / `admin` / `finance`(历史兼容) / `superadmin`。`finance` 是早期遗留、与 `admin` 等价，`require_admin` 同时接受，新代码用 `admin`；托管身份写入 `app_users.managed_role`。
 
 ## 项目约定
 
@@ -24,7 +24,7 @@
 - **敏感配置走 `.env`**（飞书 Secret、`SESSION_SECRET`），`.env` 已在 `.gitignore`，**绝不提交**。新增配置项同步更新 `.env.example`。
 - **Git 提交**：message 用中文，每个完整功能/修复一次提交；结尾保留 `Co-Authored-By` 行。推送用 SSH（已配免密）。`.env`、`*.db`、`uploads/`、`*.bak`、`__pycache__/` 不进仓库。
 - **每次提交前更新 `.ai/PROJECT_STATE.md`**：按其顶部「维护协议」刷新当前状态/最近完成/待办/已知问题，随代码一起提交。它是项目单一事实来源，必须保持最新。
-- 改动涉及"可观察行为"时，习惯用 curl/浏览器手动验证（无自动化测试）。
+- 改动涉及"可观察行为"时，先跑相关回归测试；复杂页面再用 curl/浏览器手动验证。
 
 ## 不能随意修改的部分（改前务必想清楚）
 
@@ -35,4 +35,4 @@
 4. **`FEISHU_REDIRECT_URI` 必须与飞书后台「重定向 URL」完全一致**，否则登录失败。换部署地址时，`.env` 和飞书后台要同步改、并在飞书重新发布版本。
 5. **数据库表结构**：增改字段走 `ensure_column`，不要直接改 `CREATE TABLE` 后期望旧库自动变更（已上线库不会重建）。
 6. **金额单位**：数据库存分（`amount_cents`），任何涉及金额的改动注意单位换算（用 `parse_amount` / `money`）。
-7. **超级管理员根权限**只能由 `.env` 的 `FEISHU_SUPERADMIN_OPEN_IDS` 指定；普通管理员才在数据库 `app_users.is_admin` 里。不要把超管也挪进数据库（会丢失"根"）。
+7. **超级管理员根权限**只能由 `.env` 的 `FEISHU_SUPERADMIN_OPEN_IDS` 指定；普通管理员和事业部总经理等托管身份存在数据库 `app_users.managed_role` 里，旧字段 `is_admin` 仅用于兼容早期管理员逻辑。不要把超管也挪进数据库（会丢失"根"）。
