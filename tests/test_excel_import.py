@@ -157,6 +157,61 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["receiver_company"], "北京蒲公英教育科技有限公司")
 
+    def test_duplicate_exists_ignores_closed_payments(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
+                amount_cents INTEGER NOT NULL,
+                bank_note TEXT,
+                serial_no TEXT,
+                status TEXT NOT NULL
+            );
+            """
+        )
+        item_with_serial = {
+            "received_date": "2026-07-01",
+            "payer_name": "北京测试学校",
+            "amount": "1000",
+            "bank_note": "报名费",
+            "serial_no": "SERIAL-001",
+        }
+        conn.execute(
+            """
+            INSERT INTO payments (id, received_date, payer_name, amount_cents, bank_note, serial_no, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, "2026-07-01", "北京测试学校", 100000, "报名费", "SERIAL-001", "closed"),
+        )
+
+        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial, 100000))
+        conn.execute("UPDATE payments SET status = 'pending' WHERE id = 1")
+        self.assertTrue(self.app.duplicate_exists(conn, item_with_serial, 100000))
+
+        conn.execute("DELETE FROM payments")
+        item_without_serial = {
+            "received_date": "2026-07-01",
+            "payer_name": "北京测试学校",
+            "amount": "1000",
+            "bank_note": "报名费",
+            "serial_no": "",
+        }
+        conn.execute(
+            """
+            INSERT INTO payments (id, received_date, payer_name, amount_cents, bank_note, serial_no, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (2, "2026-07-01", "北京测试学校", 100000, "报名费", "", "closed"),
+        )
+
+        self.assertFalse(self.app.duplicate_exists(conn, item_without_serial, 100000))
+        conn.execute("UPDATE payments SET status = 'pending' WHERE id = 2")
+        self.assertTrue(self.app.duplicate_exists(conn, item_without_serial, 100000))
+
     def test_bulk_close_payments_skips_closed_and_logs(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -494,6 +549,191 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual([row["note"] for row in claim_rows], ["2本杂志", "2个参会名额"])
         self.assertEqual(audit_row["action"], "split_claim_submit")
 
+    def test_submit_batch_claims_creates_one_pending_claim_per_payment(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                team TEXT,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                customer_project TEXT,
+                contract_invoice TEXT,
+                note TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        department = self.app.DEPARTMENTS[0]
+        team = next(iter(self.app.CATALOG[department]))
+        project = self.app.CATALOG[department][team][0]
+        conn.executemany(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            [(1, 10000, "pending"), (2, 25000, "pending")],
+        )
+        actor = {"id": "batch-user", "name": "批量同事", "role": "claimant"}
+
+        detail = self.app.submit_batch_claims(
+            conn,
+            actor,
+            [1, 2],
+            department,
+            team,
+            project,
+            "统一采购",
+        )
+
+        payments = conn.execute("SELECT id, status FROM payments ORDER BY id").fetchall()
+        claims = conn.execute(
+            "SELECT payment_id, amount_cents, department, team, customer_project, note, status FROM claims ORDER BY id"
+        ).fetchall()
+        audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["count"], 2)
+        self.assertEqual(detail["amount_cents"], 35000)
+        self.assertEqual(detail["skipped"], [])
+        self.assertEqual([row["status"] for row in payments], ["pending_confirm", "pending_confirm"])
+        self.assertEqual([row["payment_id"] for row in claims], [1, 2])
+        self.assertEqual([row["amount_cents"] for row in claims], [10000, 25000])
+        self.assertTrue(all(row["department"] == department for row in claims))
+        self.assertTrue(all(row["team"] == team for row in claims))
+        self.assertTrue(all(row["customer_project"] == project for row in claims))
+        self.assertEqual([row["note"] for row in claims], ["统一采购", "统一采购"])
+        self.assertEqual([row["status"] for row in claims], ["pending", "pending"])
+        self.assertEqual(audit_row["action"], "batch_claim_submit")
+        self.assertEqual(json.loads(audit_row["detail_json"])["payment_ids"], [1, 2])
+
+    def test_submit_batch_claims_uses_remaining_amount_and_skips_invalid_rows(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                team TEXT,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                customer_project TEXT,
+                contract_invoice TEXT,
+                note TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        department = self.app.DEPARTMENTS[0]
+        team = next(iter(self.app.CATALOG[department]))
+        project = self.app.CATALOG[department][team][0]
+        conn.executemany(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            [(1, 10000, "partial_claiming"), (2, 8000, "closed")],
+        )
+        conn.execute(
+            """
+            INSERT INTO claims
+                (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            """,
+            (1, department, team, 3000, "other-user", "其他同事", project, "已认领部分", "2026-07-01 10:00:00"),
+        )
+        actor = {"id": "batch-user", "name": "批量同事", "role": "claimant"}
+
+        detail = self.app.submit_batch_claims(
+            conn,
+            actor,
+            [1, 2, 999],
+            department,
+            team,
+            project,
+            "",
+        )
+
+        payment = conn.execute("SELECT status, finance_note FROM payments WHERE id = 1").fetchone()
+        claims = conn.execute("SELECT payment_id, amount_cents, actor_id, status FROM claims ORDER BY id").fetchall()
+
+        self.assertEqual(detail["count"], 1)
+        self.assertEqual(detail["amount_cents"], 7000)
+        self.assertEqual(detail["payment_ids"], [1])
+        self.assertEqual(
+            detail["skipped"],
+            [
+                {"payment_id": 2, "reason": "status", "status": "closed"},
+                {"payment_id": 999, "reason": "not_found"},
+            ],
+        )
+        self.assertEqual(payment["status"], "pending_confirm")
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款，待管理员确认")
+        self.assertEqual([row["amount_cents"] for row in claims], [3000, 7000])
+        self.assertEqual(claims[-1]["actor_id"], "batch-user")
+        self.assertEqual(claims[-1]["status"], "pending")
+
     def test_admin_payment_sort_clause_is_whitelisted(self) -> None:
         clause, sort, direction = self.app.admin_payment_order_clause("amount", "asc")
         self.assertEqual(sort, "amount")
@@ -640,6 +880,72 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(user_all_dashboard["total_cents"], 50000)
         self.assertIn((department, 32000), user_all_dashboard["departments"])
         self.assertIn((other_department, 18000), user_all_dashboard["departments"])
+
+    def test_today_claim_plain_text_groups_payer_and_skips_unclaimed(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                department TEXT NOT NULL,
+                customer_project TEXT,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
+            """
+        )
+        conn.executemany(
+            "INSERT INTO payments (id, received_date, payer_name, status) VALUES (?, ?, ?, ?)",
+            [
+                (1, "2026-07-01", "银联POS款", "pending_confirm"),
+                (2, "2026-07-01", "银联POS款", "pending_confirm"),
+                (3, "2026-07-01", "南京工业大学实验小学", "pending_confirm"),
+                (4, "2026-07-01", "未认领客户", "pending"),
+                (5, "2026-07-01", "已取消客户", "pending"),
+                (6, "2026-07-02", "明日客户", "pending_confirm"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO claims (id, payment_id, department, customer_project, amount_cents, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "学生发展事业部", "咖啡收入", 40540, "accepted"),
+                (2, 1, "学生发展事业部", "产品与文创", 15200, "pending"),
+                (3, 2, "学生发展事业部", "阅读创新", 59130, "accepted"),
+                (4, 3, "教育智能研究院", "云智库地图", 60600, "accepted"),
+                (5, 3, "教育智能研究院", "家长认知与行为地图", 3600, "pending"),
+                (6, 5, "学生发展事业部", "已取消项目", 99900, "canceled"),
+                (7, 6, "学生发展事业部", "明日项目", 10000, "accepted"),
+            ],
+        )
+
+        text = self.app.build_today_claim_plain_text(conn, "2026-07-01")
+
+        self.assertEqual(
+            text,
+            "\n".join(
+                [
+                    "7月1日",
+                    "",
+                    "1.银联POS款\t1,148.70元（学生发展事业部  咖啡收入405.40元，产品与文创152.00元，阅读创新591.30元）",
+                    "2.南京工业大学实验小学\t642.00元（教育智能研究院  云智库地图606.00元，家长认知与行为地图36.00元）",
+                    "今日合计：1,790.70元",
+                ]
+            ),
+        )
+        self.assertNotIn("未认领客户", text)
+        self.assertNotIn("已取消客户", text)
+        self.assertNotIn("明日客户", text)
 
     def test_profile_setup_modal_only_for_authed_users_without_complete_profile(self) -> None:
         actor = {"id": "u1", "name": "测试用户", "role": "claimant", "authed": "1"}

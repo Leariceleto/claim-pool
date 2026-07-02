@@ -21,7 +21,7 @@ FastAPI (app.py, uvicorn)
 
 ```
 财务工具/
-├─ app.py              # 全部后端 + 内联 HTML/CSS/JS（约 3900 行，唯一主程序）
+├─ app.py              # 全部后端 + 内联 HTML/CSS/JS（约 4800 行，唯一主程序）
 ├─ catalog.json        # 部门→中心→项目 三级分类数据（业务基础目录）
 ├─ catalog.json.bak    # 旧分类备份（历史残留，可忽略）
 ├─ requirements.txt    # 依赖
@@ -49,7 +49,7 @@ FastAPI (app.py, uvicorn)
 | 身份与鉴权 | `actor_from_request`（会话优先，无会话强制 claimant）/ `compute_role`（实时角色）/ `require_admin` / `require_superadmin` |
 | 渲染工具 | `page`（统一页面框架/导航/登录态）/ `BASE_CSS` / `department_select` / `team_select` / `status_badge` / `catalog_script` |
 | 导入解析 | `read_table` / `rows_from_excel` / `parse_pdf_receipts` / `canonical_header` / `parse_amount` / `parse_date` / `duplicate_exists` |
-| 业务工具 | `refresh_payment_claim_status` / `claim_totals` / `submit_split_claims` / `cancel_my_claim` / `personal_dashboard_data` |
+| 业务工具 | `refresh_payment_claim_status` / `claim_totals` / `submit_batch_claims` / `submit_split_claims` / `cancel_my_claim` / `build_today_claim_plain_text` / `personal_dashboard_data` |
 | 路由 | 见下表 |
 
 ## 路由清单
@@ -63,6 +63,7 @@ FastAPI (app.py, uvicorn)
 | GET `/attachments/{filename}` | 管理员 | 下载凭证附件 |
 | GET `/search` | 登录后使用 | 认领搜索 + 待认领列表（日期筛选） |
 | POST `/claim/{payment_id}` | 登录 | 提交普通认领 |
+| POST `/claim/batch` | 登录 | 批量认领搜索页勾选的多笔到款 |
 | GET `/split-claim` | 登录 | 分摊认领搜索与填写页面 |
 | POST `/split-claim/{payment_id}` | 登录 | 提交一笔到款的多行分摊认领 |
 | GET `/me` | 登录 | 个人中心、数据看板、我的认领 |
@@ -71,6 +72,7 @@ FastAPI (app.py, uvicorn)
 | GET `/admin` | 管理员 | 管理后台 |
 | GET `/admin/payments/table` | 管理员 | 后台到款池表格片段 |
 | GET `/admin/export/today` | 管理员 | 导出今日 CSV |
+| GET `/admin/export/today-text` | 管理员 | 导出今日认领纯文本摘要 |
 | POST `/admin/import` | 管理员 | 导入流水 |
 | POST `/admin/batches/{id}/confirm` | 管理员 | 确认入池（draft→pending） |
 | POST `/admin/batches/{id}/cancel` | 管理员 | 取消导入批次 |
@@ -106,8 +108,10 @@ FastAPI (app.py, uvicorn)
 2. **角色判定**（每请求实时）：`actor_from_request` 读签名会话 → `compute_role(open_id)`：超管白名单 `FEISHU_SUPERADMIN_OPEN_IDS` → `superadmin`；数据库 `managed_role` 为 `admin/general_manager` → 对应角色；旧 `is_admin=1` → `admin`；否则 `claimant`。**会话 cookie 不存角色**。
 3. **项目目录**：启动时加载 `catalog.json` 基础目录 → 按 `catalog_project_changes` 增加或隐藏项目 → 生成运行时 `CATALOG`。
 4. **普通认领**：用户选三级分类 → 后端校验必须匹配运行时 `CATALOG` → 写 `claims` + 根据金额和已有认领刷新 `payments.status`。
-5. **部分认领**：一笔款可被多条认领覆盖。未认满保持 `partial_claiming`，认满后进入财务确认或完成状态。
-6. **分摊认领**：用户在 `/split-claim` 对同一笔款填写多行部门/中心/项目/金额 → `submit_split_claims` 写多条 `claims` → 刷新到款状态 → 等财务确认。
-7. **本人取消认领**：`/me/claims/{id}/cancel` 只允许认领本人取消 `pending/accepted` 状态的 claim → claim 置 `canceled` → 到款状态重新计算并回到待认领或部分认领中。
-8. **跨部门参与范围**：管理员在后台写 `user_scopes`；个人中心根据“全部角色 / 主身份 / 单个参与范围”构造 `dashboard_scopes`，看板按范围汇总，`我的认领` 仍只展示本人记录。
-9. **驳回退回**：管理员驳回认领 → `feishu_send_text` 通知原认领人 → 款项回到待认领或重新计算状态 → 写审计。发消息失败不阻断退回。
+5. **批量认领**：用户在搜索页勾选多笔 `pending/partial_claiming` 到款 → 统一选择部门/中心/项目 → `submit_batch_claims` 按每笔剩余可认领金额分别写 `claims` → 刷新状态。
+6. **部分认领**：一笔款可被多条认领覆盖。未认满保持 `partial_claiming`，认满后进入财务确认或完成状态。
+7. **分摊认领**：用户在 `/split-claim` 对同一笔款填写多行部门/中心/项目/金额 → `submit_split_claims` 写多条 `claims` → 刷新到款状态 → 等财务确认。
+8. **本人取消认领**：`/me/claims/{id}/cancel` 只允许认领本人取消 `pending/accepted` 状态的 claim → claim 置 `canceled` → 到款状态重新计算并回到待认领或部分认领中。
+9. **跨部门参与范围**：管理员在后台写 `user_scopes`；个人中心根据“全部角色 / 主身份 / 单个参与范围”构造 `dashboard_scopes`，看板按范围汇总，`我的认领` 仍只展示本人记录。
+10. **当日导出**：CSV 导出按到款日期输出今日流水和认领记录；纯文本导出只汇总今日已有 `pending/accepted` 认领的款项，按付款方合并，并在括号内按部门/项目汇总金额。
+11. **驳回退回**：管理员驳回认领 → `feishu_send_text` 通知原认领人 → 款项回到待认领或重新计算状态 → 写审计。发消息失败不阻断退回。

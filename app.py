@@ -1473,7 +1473,10 @@ def rows_from_pdf(path: Path) -> tuple[list[dict[str, str]], str]:
 def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str], amount_cents: int) -> bool:
     serial_no = item.get("serial_no", "").strip()
     if serial_no:
-        row = conn.execute("SELECT id FROM payments WHERE serial_no = ? LIMIT 1", (serial_no,)).fetchone()
+        row = conn.execute(
+            "SELECT id FROM payments WHERE serial_no = ? AND status != 'closed' LIMIT 1",
+            (serial_no,),
+        ).fetchone()
         if row:
             return True
     row = conn.execute(
@@ -1483,6 +1486,7 @@ def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str], amount_cent
           AND payer_name = ?
           AND amount_cents = ?
           AND COALESCE(bank_note, '') = ?
+          AND status != 'closed'
         LIMIT 1
         """,
         (
@@ -1722,6 +1726,95 @@ function confirmBulkClose() {
 }
 """
 
+COPY_TODAY_TEXT_JS = """
+function copyTextWithFallback(text, status) {
+  function copied() {
+    if (status) status.textContent = '已复制今日纯文本。';
+  }
+  function fallback() {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    try {
+      document.execCommand('copy');
+      copied();
+    } catch (err) {
+      if (status) status.textContent = '复制失败，请手动下载 CSV。';
+    }
+    document.body.removeChild(area);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(copied).catch(fallback);
+  } else {
+    fallback();
+  }
+}
+document.addEventListener('DOMContentLoaded', function () {
+  var button = document.getElementById('copy-today-plain-text');
+  var status = document.getElementById('copy-today-plain-text-status');
+  if (!button) return;
+  button.addEventListener('click', function () {
+    button.disabled = true;
+    if (status) status.textContent = '正在整理...';
+    fetch('/admin/export/today-text', {headers: {'X-Requested-With': 'fetch'}})
+      .then(function (response) {
+        if (!response.ok) throw new Error('copy text export failed');
+        return response.text();
+      })
+      .then(function (text) {
+        copyTextWithFallback(text, status);
+      })
+      .catch(function () {
+        if (status) status.textContent = '整理失败，请刷新后重试。';
+      })
+      .finally(function () {
+        button.disabled = false;
+      });
+  });
+});
+"""
+
+BATCH_CLAIM_JS = """
+function updateBatchClaimState() {
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('.batch-claim-checkbox:not(:disabled)'));
+  var checked = boxes.filter(function (box) { return box.checked; });
+  var checkedIds = {};
+  checked.forEach(function (box) { checkedIds[box.value] = true; });
+  var uniqueCount = Object.keys(checkedIds).length;
+  var count = document.getElementById('batch-claim-selected-count');
+  var button = document.getElementById('batch-claim-button');
+  var all = document.getElementById('batch-claim-select-all');
+  if (count) count.textContent = uniqueCount;
+  if (button) button.disabled = uniqueCount === 0;
+  if (all) {
+    all.checked = boxes.length > 0 && checked.length === boxes.length;
+    all.indeterminate = checked.length > 0 && checked.length < boxes.length;
+  }
+}
+document.addEventListener('change', function (e) {
+  if (e.target.id === 'batch-claim-select-all') {
+    var boxes = document.querySelectorAll('.batch-claim-checkbox:not(:disabled)');
+    boxes.forEach(function (box) { box.checked = e.target.checked; });
+    updateBatchClaimState();
+  } else if (e.target.classList.contains('batch-claim-checkbox')) {
+    updateBatchClaimState();
+  }
+});
+document.addEventListener('DOMContentLoaded', updateBatchClaimState);
+function confirmBatchClaim() {
+  var checked = Array.prototype.slice.call(document.querySelectorAll('.batch-claim-checkbox:checked'));
+  var checkedIds = {};
+  checked.forEach(function (box) { checkedIds[box.value] = true; });
+  var count = Object.keys(checkedIds).length;
+  if (count === 0) return false;
+  return confirm('确定批量认领选中的 ' + count + ' 笔到款吗？系统会按每笔剩余可认领金额分别生成认领记录。');
+}
+"""
+
 
 DIAGNOSTIC_LOG_JS = """
 (function () {
@@ -1821,7 +1914,11 @@ def catalog_script() -> str:
 
 
 def admin_script() -> str:
-    return catalog_script() + "<script>" + BULK_ADMIN_JS + "</script>"
+    return catalog_script() + "<script>" + BULK_ADMIN_JS + COPY_TODAY_TEXT_JS + "</script>"
+
+
+def search_script() -> str:
+    return catalog_script() + "<script>" + BATCH_CLAIM_JS + "</script>"
 
 
 def personal_script() -> str:
@@ -1857,6 +1954,59 @@ def claim_summary_html(conn: sqlite3.Connection, row: sqlite3.Row, show_amount: 
     )
 
 
+def batch_claim_checkbox_html(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    if row["status"] not in {"pending", "partial_claiming"}:
+        return ""
+    totals = claim_totals(conn, row["id"])
+    remaining = max((row["amount_cents"] or 0) - totals["active"], 0)
+    if remaining <= 0:
+        return ""
+    return (
+        f'<input class="batch-claim-checkbox" form="batch-claim-form" type="checkbox" '
+        f'name="payment_ids" value="{row["id"]}" aria-label="选择到款 #{row["id"]}">'
+    )
+
+
+def batch_claim_panel_html(actor: dict[str, str]) -> str:
+    my_dept = actor.get("department") if actor.get("department") in DEPARTMENTS else ""
+    my_team = actor.get("team", "")
+    return f"""
+    <div class="panel cascade-scope">
+      <form id="batch-claim-form" method="post" action="/claim/batch" onsubmit="return confirmBatchClaim()">
+        <div class="row">
+          <div>
+            <label>选择</label>
+            <label class="muted" style="display:flex; align-items:center; gap:8px; margin:9px 0 0; white-space:nowrap">
+              <input id="batch-claim-select-all" type="checkbox" style="width:auto; margin:0; box-shadow:none">
+              全选当前页
+            </label>
+          </div>
+          <div style="flex:1; min-width:180px">
+            <label>批量认领部门</label>
+            {department_select("department", my_dept, required=True, class_name="cs-dept")}
+          </div>
+          <div style="flex:1; min-width:180px">
+            <label>中心 / 小组</label>
+            {team_select("team", my_dept, my_team, required=True)}
+          </div>
+          <div style="flex:1.2; min-width:220px">
+            <label>项目</label>
+            {project_select("customer_project", my_dept, my_team, required=True)}
+          </div>
+          <div style="flex:1; min-width:180px">
+            <label>统一备注</label>
+            <input name="note" placeholder="可选，会写入每笔认领">
+          </div>
+          <div>
+            <button id="batch-claim-button" type="submit" disabled>批量认领选中款项</button>
+          </div>
+        </div>
+        <p class="hint">已选 <strong id="batch-claim-selected-count">0</strong> 笔。默认按每笔剩余可认领金额提交；不同归属或拆分金额请用“分摊认领”。</p>
+      </form>
+    </div>
+    """
+
+
 def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
     my_dept = actor.get("department") if actor.get("department") in DEPARTMENTS else ""
     my_team = actor.get("team", "")
@@ -1881,6 +2031,87 @@ def claim_form_html(row: sqlite3.Row, actor: dict[str, str]) -> str:
       </div>
     </details>
     """
+
+
+def submit_batch_claims(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    payment_ids: list[int],
+    department: str,
+    team: str,
+    customer_project: str,
+    note: str = "",
+    request: Optional[Request] = None,
+) -> dict[str, Any]:
+    department = require_department(department)
+    team = team.strip()
+    customer_project = customer_project.strip()
+    note = note.strip()
+    if team not in CATALOG.get(department, {}):
+        raise HTTPException(status_code=400, detail="请选择该部门下的中心/小组")
+    if customer_project not in CATALOG[department][team]:
+        raise HTTPException(status_code=400, detail="请选择该中心/小组下的项目")
+
+    unique_ids = list(dict.fromkeys(int(payment_id) for payment_id in payment_ids if int(payment_id) > 0))
+    if not unique_ids:
+        raise HTTPException(status_code=400, detail="请先勾选需要批量认领的到款")
+
+    created_claim_ids: list[int] = []
+    claimed_payment_ids: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    total_amount_cents = 0
+    for payment_id in unique_ids:
+        row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not row:
+            skipped.append({"payment_id": payment_id, "reason": "not_found"})
+            continue
+        if row["status"] not in {"pending", "partial_claiming"}:
+            skipped.append({"payment_id": payment_id, "reason": "status", "status": row["status"]})
+            continue
+        totals = claim_totals(conn, payment_id)
+        remaining_amount = max(row["amount_cents"] - totals["active"], 0)
+        if remaining_amount <= 0:
+            skipped.append({"payment_id": payment_id, "reason": "no_remaining"})
+            continue
+
+        cur = conn.execute(
+            """
+            INSERT INTO claims
+                (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            """,
+            (
+                payment_id,
+                department,
+                team,
+                remaining_amount,
+                actor["id"],
+                actor["name"],
+                customer_project,
+                note,
+                now_text(),
+            ),
+        )
+        created_claim_ids.append(cur.lastrowid)
+        claimed_payment_ids.append(payment_id)
+        total_amount_cents += remaining_amount
+        refresh_payment_claim_status(conn, payment_id)
+
+    if not created_claim_ids:
+        raise HTTPException(status_code=409, detail="选中的到款都无法批量认领，请刷新后重试")
+
+    detail = {
+        "payment_ids": claimed_payment_ids,
+        "claim_ids": created_claim_ids,
+        "department": department,
+        "team": team,
+        "customer_project": customer_project,
+        "count": len(created_claim_ids),
+        "amount_cents": total_amount_cents,
+        "skipped": skipped,
+    }
+    audit(conn, actor, "batch_claim_submit", None, detail, request)
+    return detail
 
 
 def split_claim_line_rows(count: int = 6) -> str:
@@ -2086,6 +2317,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
                 rows.append(
                     f"""
                     <tr>
+                      <td class="select-cell">{batch_claim_checkbox_html(conn, row)}</td>
                       <td class="nowrap">{esc(row["received_date"])}</td>
                       <td class="num">¥ {money(row["amount_cents"])}</td>
                       <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
@@ -2099,7 +2331,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         result_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
+          <thead><tr><th class="select-cell"></th><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -2149,6 +2381,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
             rows = [
                 f"""
                 <tr>
+                  <td class="select-cell">{batch_claim_checkbox_html(conn, row)}</td>
                   <td class="nowrap">{esc(row["received_date"])}</td>
                   <td class="num">¥ {money(row["amount_cents"])}</td>
                   <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
@@ -2163,7 +2396,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         table_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
+          <thead><tr><th class="select-cell"></th><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -2198,9 +2431,10 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
       </form>
       <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
     </div>
+    {batch_claim_panel_html(actor)}
     {result_html}
     {pending_html}
-    {catalog_script()}
+    {search_script()}
     """
     return page("到款认领搜索", body, active="search", subtitle="输入客户名、金额或备注，找到属于你部门的到款并提交认领", actor=actor)
 
@@ -2308,6 +2542,32 @@ def submit_split_claim(
     with get_conn() as conn:
         submit_split_claims(conn, actor, payment_id, departments, teams, projects, amounts, notes, request)
     return RedirectResponse(f"/split-claim?q=%23{payment_id}", status_code=303)
+
+
+@app.post("/claim/batch")
+def submit_batch_claim_route(
+    request: Request,
+    payment_ids: Optional[list[int]] = Form(None),
+    department: str = Form(...),
+    team: str = Form(""),
+    customer_project: str = Form(...),
+    note: str = Form(""),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    if not actor.get("authed"):
+        raise HTTPException(status_code=403, detail="请先用飞书登录后再提交批量认领")
+    with get_conn() as conn:
+        submit_batch_claims(
+            conn,
+            actor,
+            payment_ids or [],
+            department,
+            team,
+            customer_project,
+            note,
+            request,
+        )
+    return RedirectResponse("/search", status_code=303)
 
 
 def validate_search_query(q: str) -> tuple[bool, str]:
@@ -3302,6 +3562,73 @@ def export_today_payments(request: Request) -> Response:
     )
 
 
+def plain_text_date_label(date_text: str) -> str:
+    try:
+        day = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        return date_text
+    return f"{day.month}月{day.day}日"
+
+
+def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> str:
+    rows = conn.execute(
+        """
+        SELECT
+            p.id AS payment_id,
+            p.payer_name AS payer_name,
+            c.department AS department,
+            c.customer_project AS customer_project,
+            c.amount_cents AS amount_cents
+        FROM payments p
+        JOIN claims c ON c.payment_id = p.id
+        WHERE p.received_date = ?
+          AND p.status != 'closed'
+          AND c.status IN ('pending', 'accepted')
+        ORDER BY p.id, c.id
+        """,
+        (date_text,),
+    ).fetchall()
+
+    payer_items: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payer = (row["payer_name"] or "").strip() or "未填写付款方"
+        department = (row["department"] or "").strip() or "未填写部门"
+        project = (row["customer_project"] or "").strip() or "未填写项目"
+        amount_cents = int(row["amount_cents"] or 0)
+        if amount_cents <= 0:
+            continue
+
+        payer_item = payer_items.setdefault(payer, {"total": 0, "departments": {}})
+        payer_item["total"] += amount_cents
+        dept_items = payer_item["departments"].setdefault(department, {})
+        dept_items[project] = dept_items.get(project, 0) + amount_cents
+
+    lines = [plain_text_date_label(date_text), ""]
+    grand_total = 0
+    for index, (payer, item) in enumerate(payer_items.items(), start=1):
+        grand_total += item["total"]
+        department_parts = []
+        for department, projects in item["departments"].items():
+            project_parts = [f"{project}{money(amount)}元" for project, amount in projects.items()]
+            department_parts.append(f"{department}  {'，'.join(project_parts)}")
+        lines.append(f"{index}.{payer}\t{money(item['total'])}元（{'；'.join(department_parts)}）")
+    lines.append(f"今日合计：{money(grand_total)}元")
+    return "\n".join(lines)
+
+
+@app.get("/admin/export/today-text")
+def export_today_claim_plain_text(request: Request) -> Response:
+    rate_limit(request, "export")
+    actor = actor_from_request(request)
+    require_admin(actor)
+    today = datetime.now().strftime("%Y-%m-%d")
+    with get_conn() as conn:
+        text = build_today_claim_plain_text(conn, today)
+        active_count = len([line for line in text.splitlines() if re.match(r"^\d+\.", line)])
+        audit(conn, actor, "export_today_claim_plain_text", None, {"date": today, "count": active_count}, request)
+    return Response(text, media_type="text/plain; charset=utf-8")
+
+
 def batch_status_badge(status: str) -> str:
     labels = {
         "draft": ("待确认", "draft"),
@@ -3626,9 +3953,13 @@ def admin_page(
       <div class="row" style="justify-content:space-between; align-items:center">
         <div>
           <div style="font-weight:600">当日数据导出</div>
-          <p class="hint" style="margin:4px 0 0">按到款日期导出今天的全部流水，CSV 可直接用 Excel 打开。</p>
+          <p class="hint" style="margin:4px 0 0">按到款日期导出今天的数据；CSV 可直接用 Excel 打开，纯文本用于发今日到款认领摘要。</p>
         </div>
-        <a class="login-btn" href="/admin/export/today">下载今日 CSV</a>
+        <div class="row" style="gap:8px; align-items:center; justify-content:flex-end">
+          <a class="login-btn" href="/admin/export/today">下载今日 CSV</a>
+          <button id="copy-today-plain-text" type="button" class="secondary">复制纯文本</button>
+          <span id="copy-today-plain-text-status" class="muted"></span>
+        </div>
       </div>
     </div>
 
@@ -3643,14 +3974,10 @@ def admin_page(
           </div>
           <div style="flex:1; min-width:220px">
             <label>原始凭证附件</label>
-            <input type="file" name="attachment" accept=".png,.jpg,.jpeg,.pdf,.csv,.xls,.xlsx">
+            <input type="file" name="attachment" accept=".pdf,.xls,.xlsx">
           </div>
         </div>
         <p class="hint">可上传 PDF、.xls 或 .xlsx 文件；Excel 会自动读取所有非空工作表。</p>
-        <div class="field">
-          <label>CSV / TSV / 表格文本</label>
-          <textarea name="table_text" placeholder="到款日期,付款方名称,到款公司,到款金额,银行备注,流水号"></textarea>
-        </div>
         <button type="submit">导入为待确认</button>
       </form>
     </div>
@@ -3893,7 +4220,7 @@ def status_options(current: str) -> str:
 def admin_import(
     request: Request,
     source_name: str = Form(...),
-    table_text: str = Form(...),
+    table_text: str = Form(""),
     attachment: Optional[UploadFile] = File(None),
 ) -> RedirectResponse:
     # 敏感操作：用会话实时角色鉴权，不信任表单字段，杜绝越权
@@ -3912,7 +4239,7 @@ def admin_import(
         elif suffix in {".xls", ".xlsx"}:
             rows = rows_from_excel(source_path)
     if not rows:
-        raise HTTPException(status_code=400, detail="未识别到任何流水。请粘贴 CSV / TSV / 表格文本，或上传 PDF / Excel 文件。")
+        raise HTTPException(status_code=400, detail="未识别到任何流水。请上传 PDF / Excel 文件。")
     with get_conn() as conn:
         cur = conn.execute(
             """
