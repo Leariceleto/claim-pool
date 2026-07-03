@@ -377,6 +377,7 @@ def init_db() -> None:
             "UPDATE payments SET closed_at = ? WHERE status = 'closed' AND COALESCE(closed_at, '') = ''",
             (now_text(),),
         )
+        repair_rejected_payments_to_pending(conn)
         refresh_catalog(conn)
 
 
@@ -4480,6 +4481,120 @@ def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> N
         )
 
 
+def reset_payment_to_initial_pending(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    payment_id: int,
+    reason: str = "",
+    action: str = "reset_payment_to_pending",
+    request: Optional[Request] = None,
+    detail_extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    if not payment:
+        raise HTTPException(status_code=404, detail="到款记录不存在")
+    reason = reason.strip()
+    active_claims = conn.execute(
+        """
+        SELECT id FROM claims
+        WHERE payment_id = ? AND status IN ('pending', 'accepted')
+        ORDER BY id
+        """,
+        (payment_id,),
+    ).fetchall()
+    reset_claim_ids = [int(row["id"]) for row in active_claims]
+    if reset_claim_ids:
+        placeholders = ",".join("?" for _ in reset_claim_ids)
+        conn.execute(
+            f"UPDATE claims SET status = 'rejected' WHERE id IN ({placeholders})",
+            reset_claim_ids,
+        )
+    finance_note = f"驳回退回：{reason}" if reason else "驳回退回"
+    conn.execute(
+        """
+        UPDATE payments
+        SET status = 'pending',
+            claimed_department = NULL,
+            claimed_team = NULL,
+            claimed_by = NULL,
+            claimed_by_name = NULL,
+            claimed_at = NULL,
+            customer_project = NULL,
+            claim_note = NULL,
+            finance_note = ?,
+            closed_at = NULL
+        WHERE id = ?
+        """,
+        (finance_note, payment_id),
+    )
+    detail = {
+        "payment_status": "pending",
+        "reset_claim_ids": reset_claim_ids,
+        "reason": reason,
+    }
+    if detail_extra:
+        detail.update(detail_extra)
+    audit(conn, actor, action, payment_id, detail, request)
+    return detail
+
+
+def repair_rejected_payments_to_pending(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT id, finance_note FROM payments
+        WHERE status = 'rejected'
+        ORDER BY id
+        """
+    ).fetchall()
+    repaired_ids: list[int] = []
+    reset_claim_ids: list[int] = []
+    for row in rows:
+        payment_id = int(row["id"])
+        active_claims = conn.execute(
+            """
+            SELECT id FROM claims
+            WHERE payment_id = ? AND status IN ('pending', 'accepted')
+            ORDER BY id
+            """,
+            (payment_id,),
+        ).fetchall()
+        claim_ids = [int(claim["id"]) for claim in active_claims]
+        if claim_ids:
+            placeholders = ",".join("?" for _ in claim_ids)
+            conn.execute(
+                f"UPDATE claims SET status = 'rejected' WHERE id IN ({placeholders})",
+                claim_ids,
+            )
+            reset_claim_ids.extend(claim_ids)
+        finance_note = (row["finance_note"] or "").strip() or "驳回退回"
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'pending',
+                claimed_department = NULL,
+                claimed_team = NULL,
+                claimed_by = NULL,
+                claimed_by_name = NULL,
+                claimed_at = NULL,
+                customer_project = NULL,
+                claim_note = NULL,
+                finance_note = ?,
+                closed_at = NULL
+            WHERE id = ?
+            """,
+            (finance_note, payment_id),
+        )
+        audit(
+            conn,
+            {"id": "system", "name": "系统修复", "role": "system"},
+            "repair_rejected_payment_to_pending",
+            payment_id,
+            {"payment_status": "pending", "reset_claim_ids": claim_ids},
+        )
+        repaired_ids.append(payment_id)
+    return {"payment_ids": repaired_ids, "reset_claim_ids": reset_claim_ids}
+
+
 def cancel_my_claim(
     conn: sqlite3.Connection,
     actor: dict[str, str],
@@ -4712,6 +4827,16 @@ def resolve_payment(
                 """,
                 (finance_note, payment_id),
             )
+        elif status == "rejected":
+            reset_payment_to_initial_pending(
+                conn,
+                actor,
+                payment_id,
+                finance_note,
+                action="resolve_payment_reject",
+                request=request,
+            )
+            return RedirectResponse("/admin", status_code=303)
         else:
             conn.execute(
                 """
@@ -4761,22 +4886,14 @@ def reject_payment(
             if APP_BASE_URL:
                 lines.append(f"重新认领：{APP_BASE_URL}/search")
             notified = feishu_send_text(claimed_by, "\n".join(lines))
-        # 退回待认领池，清空认领归属，保留驳回原因到管理备注
-        conn.execute(
-            """
-            UPDATE payments
-            SET status = 'pending',
-                claimed_department = NULL, claimed_team = NULL,
-                claimed_by = NULL, claimed_by_name = NULL, claimed_at = NULL,
-                customer_project = NULL, claim_note = NULL,
-                finance_note = ?
-            WHERE id = ?
-            """,
-            (f"驳回退回：{reason}" if reason else "驳回退回", payment_id),
-        )
-        audit(
-            conn, actor, "reject_payment", payment_id,
-            {"prev_claimed_by": claimed_by, "reason": reason, "notified": notified}, request,
+        detail = reset_payment_to_initial_pending(
+            conn,
+            actor,
+            payment_id,
+            reason,
+            action="reject_payment",
+            request=request,
+            detail_extra={"prev_claimed_by": claimed_by, "notified": notified},
         )
     return RedirectResponse("/admin", status_code=303)
 

@@ -463,6 +463,192 @@ class ExcelImportTests(unittest.TestCase):
         claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
         self.assertEqual(claim["status"], "pending")
 
+    def test_admin_reject_resets_payment_to_initial_pending_state(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT,
+                closed_at TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                199800,
+                "claimed",
+                "培训事业部",
+                "教师培训",
+                "user-a",
+                "认领同事",
+                "2026-07-03 10:00:00",
+                "教师培训网络课程费",
+                "原认领备注",
+                "",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, status) VALUES (?, ?, ?, ?, ?)",
+            (1, 1, 199800, "user-a", "accepted"),
+        )
+
+        detail = self.app.reset_payment_to_initial_pending(
+            conn,
+            {"id": "finance", "name": "财务管理员", "role": "admin"},
+            1,
+            "部门归属不对",
+            action="reject_payment",
+        )
+
+        payment = conn.execute(
+            """
+            SELECT status, claimed_department, claimed_team, claimed_by, claimed_by_name,
+                   claimed_at, customer_project, claim_note, finance_note
+            FROM payments WHERE id = 1
+            """
+        ).fetchone()
+        claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
+        audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["payment_status"], "pending")
+        self.assertEqual(detail["reset_claim_ids"], [1])
+        self.assertEqual(self.app.claim_totals(conn, 1), {"active": 0, "accepted": 0, "pending": 0})
+        self.assertEqual(payment["status"], "pending")
+        self.assertIsNone(payment["claimed_department"])
+        self.assertIsNone(payment["claimed_team"])
+        self.assertIsNone(payment["claimed_by"])
+        self.assertIsNone(payment["claimed_by_name"])
+        self.assertIsNone(payment["claimed_at"])
+        self.assertIsNone(payment["customer_project"])
+        self.assertIsNone(payment["claim_note"])
+        self.assertEqual(payment["finance_note"], "驳回退回：部门归属不对")
+        self.assertEqual(claim["status"], "rejected")
+        self.assertEqual(audit_row["action"], "reject_payment")
+
+    def test_startup_repair_moves_existing_rejected_payments_back_to_pending(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT,
+                closed_at TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                actor_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    199800,
+                    "rejected",
+                    "培训事业部",
+                    "教师培训",
+                    "user-a",
+                    "认领同事",
+                    "2026-07-03 10:00:00",
+                    "教师培训网络课程费",
+                    "原认领备注",
+                    "驳回退回",
+                    "",
+                ),
+                (2, 50000, "closed", "年会", "", "user-b", "其他同事", "", "报名费", "", "", "2026-07-03 12:00:00"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, 1, 199800, "user-a", "accepted"),
+                (2, 2, 50000, "user-b", "accepted"),
+            ],
+        )
+
+        detail = self.app.repair_rejected_payments_to_pending(conn)
+
+        payments = conn.execute("SELECT id, status, claimed_by, claimed_department, closed_at FROM payments ORDER BY id").fetchall()
+        claims = conn.execute("SELECT id, status FROM claims ORDER BY id").fetchall()
+        audit_row = conn.execute("SELECT action, payment_id FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["payment_ids"], [1])
+        self.assertEqual(detail["reset_claim_ids"], [1])
+        self.assertEqual([row["status"] for row in payments], ["pending", "closed"])
+        self.assertIsNone(payments[0]["claimed_by"])
+        self.assertIsNone(payments[0]["claimed_department"])
+        self.assertIsNone(payments[0]["closed_at"])
+        self.assertEqual([row["status"] for row in claims], ["rejected", "accepted"])
+        self.assertEqual(audit_row["action"], "repair_rejected_payment_to_pending")
+        self.assertEqual(audit_row["payment_id"], 1)
+
     def test_submit_split_claims_creates_pending_lines_and_refreshes_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
