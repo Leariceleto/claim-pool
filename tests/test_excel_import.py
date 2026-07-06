@@ -1114,6 +1114,156 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn('data-table-url="/admin/payments/table?sort=amount&amp;dir=asc"', header)
         self.assertIn("sort-link", header)
 
+    def test_admin_payment_row_shows_claim_note_as_remark_description(self) -> None:
+        old_db_path = self.app.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-row.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-06 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status,
+                             claimed_department, claimed_team, claimed_by, claimed_by_name, claimed_at,
+                             customer_project, claim_note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            1,
+                            1,
+                            "2026-07-06 10:00:00",
+                            "2026-07-06 10:01:00",
+                            "2026-07-06",
+                            "10:00:00",
+                            "测试客户",
+                            178000,
+                            "银行备注",
+                            "蒲公英智库",
+                            "pending_confirm",
+                            "培训事业部",
+                            "会议中心",
+                            "claim-user",
+                            "认领同事",
+                            "2026-07-06 10:05:00",
+                            "2026年班主任峰会",
+                            "统一采购",
+                        ),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, "培训事业部", "会议中心", 100000, "claim-user", "认领同事", "2026年班主任峰会", "", "统一采购", "pending", "2026-07-06 10:05:00"),
+                            (1, "培训事业部", "会议中心", 78000, "claim-user", "认领同事", "2026年班主任峰会", "", "补充说明", "pending", "2026-07-06 10:06:00"),
+                        ],
+                    )
+                    conn.commit()
+                    row = conn.execute("SELECT * FROM payments WHERE id = 1").fetchone()
+
+                    html = self.app.render_admin_payment_row(row, {"id": "finance", "name": "财务", "role": "admin"})
+
+                self.assertIn("备注说明：统一采购；补充说明", html)
+                self.assertNotIn("认领备注", html)
+                self.assertLess(html.index("银行备注"), html.index("备注说明：统一采购；补充说明"))
+        finally:
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_page_search_panel_precedes_payment_pool_with_admin_actions(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-search.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-06 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status,
+                             claimed_department, claimed_team, claimed_by, claimed_by_name, claimed_at,
+                             customer_project, claim_note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            1,
+                            1,
+                            "2026-07-06 10:00:00",
+                            "2026-07-06 10:01:00",
+                            "2026-07-06",
+                            "10:00:00",
+                            "测试客户",
+                            178000,
+                            "银行备注",
+                            "蒲公英智库",
+                            "pending_confirm",
+                            "培训事业部",
+                            "会议中心",
+                            "claim-user",
+                            "认领同事",
+                            "2026-07-06 10:05:00",
+                            "2026年班主任峰会",
+                            "统一采购",
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (1, "培训事业部", "会议中心", 178000, "claim-user", "认领同事", "2026年班主任峰会", "", "统一采购", "pending", "2026-07-06 10:05:00"),
+                    )
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=None,
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.admin_page(request, admin_q="测试客户")
+                html = response.body.decode("utf-8")
+
+                self.assertLess(html.index("到款认领搜索"), html.index("全量认领池"))
+                search_section = html[html.index("到款认领搜索"):html.index("全量认领池")]
+                self.assertIn("测试客户", search_section)
+                self.assertIn("编辑字段", search_section)
+                self.assertIn("处理状态", search_section)
+                self.assertNotIn("bulk-payment-checkbox", search_section)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
     def test_general_manager_is_identity_not_admin_permission(self) -> None:
         old_db_path = self.app.DB_PATH
         try:

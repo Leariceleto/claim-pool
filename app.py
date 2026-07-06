@@ -450,6 +450,18 @@ def build_payment_reject_message(payment: Union[sqlite3.Row, dict[str, Any]], re
     )
 
 
+def claim_note_summary(row: sqlite3.Row, claim_rows: list[sqlite3.Row]) -> str:
+    notes: list[str] = []
+    primary_note = str(row["claim_note"] or "").strip()
+    if primary_note:
+        notes.append(primary_note)
+    for claim in claim_rows:
+        note = str(claim["note"] or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+    return "；".join(notes)
+
+
 def parse_amount(value: Any) -> int:
     text = str(value or "").strip()
     text = text.replace(",", "").replace("￥", "").replace("¥", "").replace("元", "")
@@ -3820,6 +3832,24 @@ def admin_payment_rows(
     return rows, sort, direction
 
 
+def admin_claim_search_rows(
+    conn: sqlite3.Connection,
+    q: str,
+    actor: dict[str, str],
+    request: Optional[Request] = None,
+) -> tuple[list[sqlite3.Row], str]:
+    q = q.strip()
+    if not q:
+        return [], ""
+    ok, reason = validate_search_query(q)
+    if not ok:
+        audit(conn, actor, "admin_search_blocked", None, {"query": q, "reason": reason}, request)
+        return [], reason
+    rows = run_search(conn, q)
+    audit(conn, actor, "admin_search", None, {"query": q, "result_count": len(rows)}, request)
+    return rows, ""
+
+
 def render_payment_pool_html(
     payments: list[sqlite3.Row],
     actor: dict[str, str],
@@ -3854,6 +3884,61 @@ def render_payment_pool_html(
     """
 
 
+def render_admin_claim_search_panel(
+    q: str,
+    results: list[sqlite3.Row],
+    message: str,
+    actor: dict[str, str],
+) -> str:
+    q = q.strip()
+    clear_link = (
+        f'<a href="/admin" style="display:inline-block;padding:9px 0">清除搜索</a>'
+        if q else ""
+    )
+    result_html = ""
+    if message:
+        result_html = f'<div class="callout warn" style="margin-top:14px"><strong>搜索被限制：</strong>{esc(message)}</div>'
+    elif q and not results:
+        result_html = '<div class="callout info" style="margin-top:14px">没有找到匹配记录。请换一个更具体的客户名、金额或备注关键词。</div>'
+    elif results:
+        rows = "".join(render_admin_payment_row(row, actor, selectable=False) for row in results)
+        result_html = f"""
+        <div class="table-wrap" style="box-shadow:none; margin-top:14px">
+        <table class="admin-payment-table">
+          <thead><tr>
+            <th class="select-cell col-select"></th>
+            <th class="col-id">ID</th>
+            <th class="col-date">日期</th>
+            <th class="col-amount">金额</th>
+            <th class="col-receiver">到款公司</th>
+            <th>付款方 / 摘要</th>
+            <th class="col-status">状态 / 认领</th>
+            <th class="col-actions">管理操作</th>
+          </tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+        </div>
+        """
+    return f"""
+    <h2>到款认领搜索</h2>
+    <div class="panel">
+      <form method="get" action="/admin">
+        {finance_hidden(actor)}
+        <label>关键词</label>
+        <div class="row" style="align-items:end">
+          <div style="flex:1; min-width:260px">
+            <input name="admin_q" value="{esc(q)}" placeholder="客户名、付款方、精确金额或备注，可组合搜索">
+          </div>
+          <div><button type="submit">搜索</button></div>
+          {f'<div>{clear_link}</div>' if clear_link else ''}
+        </div>
+        <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
+      </form>
+      {result_html}
+    </div>
+    """
+
+
 @app.get("/admin/payments/table", response_class=HTMLResponse)
 def admin_payments_table(
     request: Request,
@@ -3875,9 +3960,11 @@ def admin_page(
     skipped: int = 0,
     sort: str = "id",
     dir: str = "desc",
+    admin_q: str = "",
 ) -> HTMLResponse:
     actor = actor_from_request(request)
     require_admin(actor)
+    admin_q = admin_q.strip()
     with get_conn() as conn:
         stats = conn.execute(
             """
@@ -3888,6 +3975,7 @@ def admin_page(
         ).fetchall()
         batches = conn.execute("SELECT * FROM import_batches ORDER BY id DESC LIMIT 10").fetchall()
         payments, sort, dir = admin_payment_rows(conn, sort, dir)
+        admin_search_results, admin_search_message = admin_claim_search_rows(conn, admin_q, actor, request)
         logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 30").fetchall()
         profiles = conn.execute(
             "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
@@ -4094,6 +4182,8 @@ def admin_page(
     </table>
     </div>
 
+    {render_admin_claim_search_panel(admin_q, admin_search_results, admin_search_message, actor)}
+
     <h2>全量认领池</h2>
     {render_payment_pool_html(payments, actor, sort, dir)}
 
@@ -4188,7 +4278,7 @@ def finance_hidden(actor: dict[str, str]) -> str:
     """
 
 
-def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
+def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable: bool = True) -> str:
     with get_conn() as conn:
         claim_rows = conn.execute(
             "SELECT * FROM claims WHERE payment_id = ? ORDER BY id DESC",
@@ -4209,6 +4299,10 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
     finance_note = ""
     if row["finance_note"]:
         finance_note = f'<div class="muted">管理备注：{esc(row["finance_note"])}</div>'
+    claim_note_text = claim_note_summary(row, claim_rows)
+    claim_note_html = ""
+    if claim_note_text:
+        claim_note_html = f'<div class="muted">备注说明：{esc(claim_note_text)}</div>'
     # 仅对已有人认领的单子（已确认/待财务确认）显示「驳回退回」
     reject_ui = ""
     if row["status"] in {"claimed", "pending_confirm"}:
@@ -4234,9 +4328,14 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
           <button class="success" type="submit">确认认领</button>
         </form>
         """
+    select_cell = (
+        f'<td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row["id"]}" aria-label="选择流水 #{row["id"]}" {"disabled" if row["status"] == "closed" else ""}></td>'
+        if selectable
+        else '<td class="select-cell col-select"></td>'
+    )
     return f"""
     <tr>
-      <td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row['id']}" aria-label="选择流水 #{row['id']}" {'disabled' if row['status'] == 'closed' else ''}></td>
+      {select_cell}
       <td class="nowrap col-id">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
       <td class="nowrap col-date">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
       <td class="num col-amount">¥ {money(row['amount_cents'])}</td>
@@ -4244,6 +4343,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str]) -> str:
       <td class="payment-summary">
         <strong>{esc(row['payer_name'])}</strong>
         <div>{esc(row['bank_note'])}</div>
+        {claim_note_html}
       </td>
       <td class="col-status">{status_badge(row['status'])}{claimed}{finance_note}</td>
       <td class="actions admin-actions col-actions">
