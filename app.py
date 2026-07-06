@@ -17,7 +17,7 @@ import zipfile
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -110,6 +110,8 @@ FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
 FEISHU_USERINFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 FEISHU_TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+FEISHU_SEND_CHAT_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+FEISHU_NOTIFY_CHAT_ID = os.environ.get("FEISHU_NOTIFY_CHAT_ID", "").strip()
 # 应用对外根地址（用于消息里的查看链接），从回调地址推导
 APP_BASE_URL = os.environ.get("APP_BASE_URL") or FEISHU_REDIRECT_URI.replace("/oauth/callback", "")
 
@@ -408,6 +410,46 @@ def receiver_company_label(value: Any) -> str:
     return str(value or "").strip() or "未填写"
 
 
+def build_batch_confirm_message(count: int, total_cents: int) -> str:
+    return "\n".join(
+        [
+            "【今日到款已入池】",
+            f"财务已确认一批到款流水入池，共 {count} 笔，合计 ¥ {money(total_cents)}。",
+            "请相关同事进入财务到款认领系统查看并认领。",
+        ]
+    )
+
+
+def build_claim_reject_message(
+    payment: Union[sqlite3.Row, dict[str, Any]],
+    claim: Union[sqlite3.Row, dict[str, Any]],
+) -> str:
+    return "\n".join(
+        [
+            "【部分到款认领被驳回】",
+            "你提交的部分到款认领已被财务驳回。",
+            f"付款方：{payment['payer_name']}",
+            f"到款日期：{payment['received_date']}",
+            f"认领金额：¥ {money(claim['amount_cents'])}",
+            f"认领归属：{claim['department']} / {claim['team']} · {claim['customer_project']}",
+            "驳回原因：未填写",
+        ]
+    )
+
+
+def build_payment_reject_message(payment: Union[sqlite3.Row, dict[str, Any]], reason: str) -> str:
+    return "\n".join(
+        [
+            "【到款认领被驳回】",
+            "你提交的到款认领已被财务驳回。",
+            f"付款方：{payment['payer_name']}",
+            f"到款日期：{payment['received_date']}",
+            f"认领归属：{payment['claimed_department'] or ''} / {payment['claimed_team'] or ''} · {payment['customer_project'] or ''}",
+            f"驳回原因：{reason.strip() or '未填写'}",
+        ]
+    )
+
+
 def parse_amount(value: Any) -> int:
     text = str(value or "").strip()
     text = text.replace(",", "").replace("￥", "").replace("¥", "").replace("元", "")
@@ -568,6 +610,22 @@ def feishu_send_text(open_id: str, text: str) -> bool:
         FEISHU_SEND_MSG_URL,
         "POST",
         {"receive_id": open_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)},
+        bearer=token,
+    )
+    return resp.get("code") == 0
+
+
+def feishu_send_chat_text(chat_id: str, text: str) -> bool:
+    """以应用机器人身份给群聊发文本。容错：失败返回 False，不影响业务动作。"""
+    if not (feishu_enabled() and chat_id):
+        return False
+    token = feishu_tenant_token()
+    if not token:
+        return False
+    resp = _feishu_request(
+        FEISHU_SEND_CHAT_MSG_URL,
+        "POST",
+        {"receive_id": chat_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)},
         bearer=token,
     )
     return resp.get("code") == 0
@@ -2075,6 +2133,7 @@ def submit_batch_claims(
             skipped.append({"payment_id": payment_id, "reason": "no_remaining"})
             continue
 
+        claim_created_at = now_text()
         cur = conn.execute(
             """
             INSERT INTO claims
@@ -2090,12 +2149,36 @@ def submit_batch_claims(
                 actor["name"],
                 customer_project,
                 note,
-                now_text(),
+                claim_created_at,
             ),
         )
         created_claim_ids.append(cur.lastrowid)
         claimed_payment_ids.append(payment_id)
         total_amount_cents += remaining_amount
+        if row["status"] == "pending" and totals["active"] == 0 and remaining_amount == row["amount_cents"]:
+            conn.execute(
+                """
+                UPDATE payments
+                SET claimed_department = ?,
+                    claimed_team = ?,
+                    claimed_by = ?,
+                    claimed_by_name = ?,
+                    claimed_at = ?,
+                    customer_project = ?,
+                    claim_note = ?
+                WHERE id = ?
+                """,
+                (
+                    department,
+                    team,
+                    actor["id"],
+                    actor["name"],
+                    claim_created_at,
+                    customer_project,
+                    note,
+                    payment_id,
+                ),
+            )
         refresh_payment_claim_status(conn, payment_id)
 
     if not created_claim_ids:
@@ -4319,14 +4402,39 @@ def confirm_batch(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
-        rows = conn.execute("SELECT id FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,)).fetchall()
-        conn.execute(
-            "UPDATE payments SET status = 'pending', confirmed_at = ? WHERE batch_id = ? AND status = 'draft'",
-            (now_text(), batch_id),
-        )
-        conn.execute("UPDATE import_batches SET status = 'confirmed' WHERE id = ?", (batch_id,))
-        audit(conn, actor, "confirm_batch", None, {"batch_id": batch_id, "count": len(rows)}, request)
+        confirm_import_batch(conn, actor, batch_id, request)
     return RedirectResponse("/admin", status_code=303)
+
+
+def confirm_import_batch(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    batch_id: int,
+    request: Optional[Request] = None,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT id, amount_cents FROM payments WHERE batch_id = ? AND status = 'draft'",
+        (batch_id,),
+    ).fetchall()
+    total_cents = sum(int(row["amount_cents"] or 0) for row in rows)
+    conn.execute(
+        "UPDATE payments SET status = 'pending', confirmed_at = ? WHERE batch_id = ? AND status = 'draft'",
+        (now_text(), batch_id),
+    )
+    conn.execute("UPDATE import_batches SET status = 'confirmed' WHERE id = ?", (batch_id,))
+
+    notified = False
+    if rows:
+        notified = feishu_send_chat_text(FEISHU_NOTIFY_CHAT_ID, build_batch_confirm_message(len(rows), total_cents))
+
+    detail = {
+        "batch_id": batch_id,
+        "count": len(rows),
+        "amount_cents": total_cents,
+        "notified": notified,
+    }
+    audit(conn, actor, "confirm_batch", None, detail, request)
+    return detail
 
 
 @app.post("/admin/batches/{batch_id}/cancel")
@@ -4719,17 +4827,7 @@ def reject_claim(
         payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
         notified = False
         if payment:
-            lines = [
-                "【部分到款认领被驳回】",
-                "你提交的部分金额认领已被管理员驳回，可重新核实后再提交。",
-                f"付款方：{payment['payer_name']}",
-                f"到款日期：{payment['received_date']}",
-                f"认领金额：¥ {money(claim['amount_cents'])}",
-                f"你填写的：{claim['department']} / {claim['team']} · {claim['customer_project']}",
-            ]
-            if APP_BASE_URL:
-                lines.append(f"重新认领：{APP_BASE_URL}/search")
-            notified = feishu_send_text(claim["actor_id"], "\n".join(lines))
+            notified = feishu_send_text(claim["actor_id"], build_claim_reject_message(payment, claim))
         conn.execute("UPDATE claims SET status = 'rejected' WHERE id = ?", (claim_id,))
         refresh_payment_claim_status(conn, claim["payment_id"])
         audit(
@@ -4874,18 +4972,7 @@ def reject_payment(
         # 先通知原认领人（飞书单聊），失败不影响退回
         notified = False
         if claimed_by:
-            lines = [
-                "【到款认领被驳回】",
-                "你认领的款项已被管理员驳回，已退回认领池，可重新核实认领。",
-                f"付款方：{row['payer_name']}",
-                f"到款日期：{row['received_date']}",
-                f"你填写的：{row['claimed_department'] or ''} / {row['claimed_team'] or ''} · {row['customer_project'] or ''}",
-            ]
-            if reason:
-                lines.append(f"驳回原因：{reason}")
-            if APP_BASE_URL:
-                lines.append(f"重新认领：{APP_BASE_URL}/search")
-            notified = feishu_send_text(claimed_by, "\n".join(lines))
+            notified = feishu_send_text(claimed_by, build_payment_reject_message(row, reason))
         detail = reset_payment_to_initial_pending(
             conn,
             actor,

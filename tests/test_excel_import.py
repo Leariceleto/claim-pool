@@ -261,6 +261,146 @@ class ExcelImportTests(unittest.TestCase):
         audit_detail = json.loads(audit_row["detail_json"])
         self.assertEqual(audit_detail["count"], 2)
 
+    def test_confirm_import_batch_sends_group_notification(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                batch_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                confirmed_at TEXT
+            );
+            CREATE TABLE import_batches (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO import_batches (id, status) VALUES (?, ?)", (7, "draft"))
+        conn.executemany(
+            "INSERT INTO payments (id, batch_id, amount_cents, status) VALUES (?, ?, ?, ?)",
+            [(1, 7, 12000, "draft"), (2, 7, 34567, "draft"), (3, 7, 999, "pending")],
+        )
+        sent: list[tuple[str, str]] = []
+        old_chat_id = self.app.FEISHU_NOTIFY_CHAT_ID
+        old_send = self.app.feishu_send_chat_text
+        self.app.FEISHU_NOTIFY_CHAT_ID = "oc_test_chat"
+        self.app.feishu_send_chat_text = lambda chat_id, text: sent.append((chat_id, text)) or True
+        try:
+            detail = self.app.confirm_import_batch(
+                conn,
+                {"id": "finance", "name": "财务管理员", "role": "admin"},
+                7,
+            )
+        finally:
+            self.app.FEISHU_NOTIFY_CHAT_ID = old_chat_id
+            self.app.feishu_send_chat_text = old_send
+
+        statuses = conn.execute("SELECT id, status FROM payments ORDER BY id").fetchall()
+        batch = conn.execute("SELECT status FROM import_batches WHERE id = 7").fetchone()
+        audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["count"], 2)
+        self.assertEqual(detail["amount_cents"], 46567)
+        self.assertTrue(detail["notified"])
+        self.assertEqual([(row["id"], row["status"]) for row in statuses], [(1, "pending"), (2, "pending"), (3, "pending")])
+        self.assertEqual(batch["status"], "confirmed")
+        self.assertEqual(sent[0][0], "oc_test_chat")
+        self.assertIn("共 2 笔，合计 ¥ 465.67", sent[0][1])
+        self.assertEqual(audit_row["action"], "confirm_batch")
+        self.assertTrue(json.loads(audit_row["detail_json"])["notified"])
+
+    def test_confirm_import_batch_continues_when_group_notification_is_unconfigured(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                batch_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                confirmed_at TEXT
+            );
+            CREATE TABLE import_batches (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO import_batches (id, status) VALUES (?, ?)", (8, "draft"))
+        conn.execute(
+            "INSERT INTO payments (id, batch_id, amount_cents, status) VALUES (?, ?, ?, ?)",
+            (1, 8, 10000, "draft"),
+        )
+        old_chat_id = self.app.FEISHU_NOTIFY_CHAT_ID
+        self.app.FEISHU_NOTIFY_CHAT_ID = ""
+        try:
+            detail = self.app.confirm_import_batch(
+                conn,
+                {"id": "finance", "name": "财务管理员", "role": "admin"},
+                8,
+            )
+        finally:
+            self.app.FEISHU_NOTIFY_CHAT_ID = old_chat_id
+
+        payment = conn.execute("SELECT status FROM payments WHERE id = 1").fetchone()
+        self.assertEqual(payment["status"], "pending")
+        self.assertFalse(detail["notified"])
+
+    def test_reject_notification_messages_include_reason_without_links(self) -> None:
+        payment_message = self.app.build_payment_reject_message(
+            {
+                "payer_name": "测试客户",
+                "received_date": "2026-07-03",
+                "claimed_department": "年会事业部",
+                "claimed_team": "创新中心",
+                "customer_project": "测试项目",
+            },
+            "部门归属不对",
+        )
+        claim_message = self.app.build_claim_reject_message(
+            {"payer_name": "测试客户", "received_date": "2026-07-03"},
+            {
+                "amount_cents": 12345,
+                "department": "年会事业部",
+                "team": "创新中心",
+                "customer_project": "测试项目",
+            },
+        )
+
+        self.assertIn("驳回原因：部门归属不对", payment_message)
+        self.assertIn("驳回原因：未填写", claim_message)
+        self.assertNotIn("重新认领", payment_message)
+        self.assertNotIn("http", payment_message)
+        self.assertNotIn("重新认领", claim_message)
+        self.assertNotIn("http", claim_message)
+
     def test_accept_payment_claims_confirms_pending_claims_and_refreshes_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -804,7 +944,14 @@ class ExcelImportTests(unittest.TestCase):
             "统一采购",
         )
 
-        payments = conn.execute("SELECT id, status FROM payments ORDER BY id").fetchall()
+        payments = conn.execute(
+            """
+            SELECT id, status, claimed_department, claimed_team, claimed_by,
+                   claimed_by_name, customer_project, claim_note
+            FROM payments
+            ORDER BY id
+            """
+        ).fetchall()
         claims = conn.execute(
             "SELECT payment_id, amount_cents, department, team, customer_project, note, status FROM claims ORDER BY id"
         ).fetchall()
@@ -814,6 +961,12 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(detail["amount_cents"], 35000)
         self.assertEqual(detail["skipped"], [])
         self.assertEqual([row["status"] for row in payments], ["pending_confirm", "pending_confirm"])
+        self.assertTrue(all(row["claimed_department"] == department for row in payments))
+        self.assertTrue(all(row["claimed_team"] == team for row in payments))
+        self.assertTrue(all(row["claimed_by"] == "batch-user" for row in payments))
+        self.assertTrue(all(row["claimed_by_name"] == "批量同事" for row in payments))
+        self.assertTrue(all(row["customer_project"] == project for row in payments))
+        self.assertTrue(all(row["claim_note"] == "统一采购" for row in payments))
         self.assertEqual([row["payment_id"] for row in claims], [1, 2])
         self.assertEqual([row["amount_cents"] for row in claims], [10000, 25000])
         self.assertTrue(all(row["department"] == department for row in claims))
@@ -883,6 +1036,15 @@ class ExcelImportTests(unittest.TestCase):
         )
         conn.execute(
             """
+            UPDATE payments
+            SET claimed_department = ?, claimed_team = ?, claimed_by = ?, claimed_by_name = ?,
+                customer_project = ?, claim_note = ?
+            WHERE id = 1
+            """,
+            ("原部门", "原中心", "other-user", "其他同事", "原项目", "原备注"),
+        )
+        conn.execute(
+            """
             INSERT INTO claims
                 (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
@@ -901,7 +1063,9 @@ class ExcelImportTests(unittest.TestCase):
             "",
         )
 
-        payment = conn.execute("SELECT status, finance_note FROM payments WHERE id = 1").fetchone()
+        payment = conn.execute(
+            "SELECT status, finance_note, claimed_department, claimed_team, claimed_by, claimed_by_name, customer_project, claim_note FROM payments WHERE id = 1"
+        ).fetchone()
         claims = conn.execute("SELECT payment_id, amount_cents, actor_id, status FROM claims ORDER BY id").fetchall()
 
         self.assertEqual(detail["count"], 1)
@@ -916,6 +1080,12 @@ class ExcelImportTests(unittest.TestCase):
         )
         self.assertEqual(payment["status"], "pending_confirm")
         self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款，待管理员确认")
+        self.assertEqual(payment["claimed_department"], "原部门")
+        self.assertEqual(payment["claimed_team"], "原中心")
+        self.assertEqual(payment["claimed_by"], "other-user")
+        self.assertEqual(payment["claimed_by_name"], "其他同事")
+        self.assertEqual(payment["customer_project"], "原项目")
+        self.assertEqual(payment["claim_note"], "原备注")
         self.assertEqual([row["amount_cents"] for row in claims], [3000, 7000])
         self.assertEqual(claims[-1]["actor_id"], "batch-user")
         self.assertEqual(claims[-1]["status"], "pending")
