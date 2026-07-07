@@ -71,18 +71,18 @@ FastAPI (app.py, uvicorn)
 | POST `/me/claims/{claim_id}/cancel` | 登录 | 本人取消自己的可取消认领 |
 | GET `/admin` | 管理员 | 管理后台 |
 | GET `/admin/payments/table` | 管理员 | 后台到款池表格片段 |
-| GET `/admin/export/today` | 管理员 | 导出今日 CSV |
-| GET `/admin/export/today-text` | 管理员 | 导出今日认领纯文本摘要 |
+| GET `/admin/export/today` | 管理员 | 按到款日期导出 CSV，未传日期默认今天 |
+| GET `/admin/export/today-text` | 管理员 | 按到款日期导出认领纯文本摘要，未传日期默认今天 |
 | POST `/admin/import` | 管理员 | 导入流水 |
 | POST `/admin/batches/{id}/confirm` | 管理员 | 确认入池（draft→pending） |
 | POST `/admin/batches/{id}/cancel` | 管理员 | 取消导入批次 |
 | POST `/admin/payments/{id}/edit` | 管理员 | 编辑流水字段（含到款公司） |
 | POST `/admin/payments/{id}/resolve` | 管理员 | 改状态/分配部门 |
 | POST `/admin/payments/{id}/reject` | 管理员 | 驳回退回 + 飞书通知 |
-| POST `/admin/payments/{id}/confirm-claims` | 管理员 | 确认部分认领完成 |
+| POST `/admin/payments/{id}/confirm-claims` | 管理员 | 兼容旧待处理认领的确认接口；新认领不再展示该操作 |
 | POST `/admin/payments/bulk-close` | 管理员 | 批量关闭到款 |
-| POST `/admin/claims/{id}/accept` | 管理员 | 接受某条认领 |
-| POST `/admin/claims/{id}/reject` | 管理员 | 驳回某条认领 |
+| POST `/admin/claims/{id}/accept` | 管理员 | 兼容旧待处理认领的单条接受接口 |
+| POST `/admin/claims/{id}/reject` | 管理员 | 兼容旧待处理认领的单条驳回接口 |
 | POST `/admin/catalog/projects` | 管理员 | 在现有部门/中心下新增或删除项目 |
 | POST `/admin/profiles/{open_id}` | 管理员 | 改某成员部门/中心 |
 | POST `/admin/scopes/{open_id}/add` | 管理员 | 给成员添加额外参与范围 |
@@ -93,8 +93,8 @@ FastAPI (app.py, uvicorn)
 
 ## 数据模型（SQLite，8 张表）
 
-- **payments**：到款主表。金额存 `amount_cents`（分）。关键字段含 `receiver_company`、付款方、银行备注、凭证、状态、认领归属和关闭时间。`status` 取值包括 `draft`、`pending`、`partial_claiming`、`claimed`、`pending_confirm`、`rejected`、`closed`。
-- **claims**：每次认领动作的流水记录，关联 `payment_id`；分摊认领会一次写入多条 `pending` claim；取消后置为 `canceled`。
+- **payments**：到款主表。金额存 `amount_cents`（分）。关键字段含 `receiver_company`、付款方、银行备注、凭证、状态、认领归属和关闭时间。`status` 取值包括 `draft`、`pending`、`partial_claiming`、`claimed`、`pending_confirm`（历史兼容）、`rejected`、`closed`。
+- **claims**：每次认领动作的流水记录，关联 `payment_id`；普通、批量和分摊认领提交后直接写入 `accepted` claim；取消后置为 `canceled`。历史 `pending` claim 启动时会自动修复为 `accepted`。
 - **import_batches**：导入批次。
 - **audit_logs**：操作审计（动作名 + JSON 详情 + 操作人角色 + IP）。
 - **user_profiles**：用户主身份的部门/中心设置（`open_id → department, team`）。
@@ -109,9 +109,9 @@ FastAPI (app.py, uvicorn)
 3. **项目目录**：启动时加载 `catalog.json` 基础目录 → 按 `catalog_project_changes` 增加或隐藏项目 → 生成运行时 `CATALOG`。
 4. **普通认领**：用户选三级分类 → 后端校验必须匹配运行时 `CATALOG` → 写 `claims` + 根据金额和已有认领刷新 `payments.status`。
 5. **批量认领**：用户在搜索页勾选多笔 `pending/partial_claiming` 到款 → 统一选择部门/中心/项目 → `submit_batch_claims` 按每笔剩余可认领金额分别写 `claims` → 刷新状态。
-6. **部分认领**：一笔款可被多条认领覆盖。未认满保持 `partial_claiming`，认满后进入财务确认或完成状态。
-7. **分摊认领**：用户在 `/split-claim` 对同一笔款填写多行部门/中心/项目/金额 → `submit_split_claims` 写多条 `claims` → 刷新到款状态 → 等财务确认。
+6. **部分认领**：一笔款可被多条认领覆盖。未认满保持 `partial_claiming`，认满后直接进入 `claimed` 已认领状态。
+7. **分摊认领**：用户在 `/split-claim` 对同一笔款填写多行部门/中心/项目/金额 → `submit_split_claims` 写多条已认领 `claims` → 刷新到款状态；财务在后台检查，发现错误可驳回退回。
 8. **本人取消认领**：`/me/claims/{id}/cancel` 只允许认领本人取消 `pending/accepted` 状态的 claim → claim 置 `canceled` → 到款状态重新计算并回到待认领或部分认领中。
 9. **跨部门参与范围**：管理员在后台写 `user_scopes`；个人中心根据“全部角色 / 主身份 / 单个参与范围”构造 `dashboard_scopes`，看板按范围汇总，`我的认领` 仍只展示本人记录。
-10. **当日导出**：CSV 导出按到款日期输出今日流水和认领记录；纯文本导出只汇总今日已有 `pending/accepted` 认领的款项，按付款方合并，并在括号内按部门/项目汇总金额。
+10. **按日期导出**：CSV 导出按所选到款日期输出流水和认领记录；纯文本导出汇总所选日期已有 `accepted`（兼容历史 `pending`）认领的款项，按付款方合并，并在括号内按部门/项目汇总金额。
 11. **驳回退回**：管理员驳回认领 → `feishu_send_text` 通知原认领人 → 款项回到待认领或重新计算状态 → 写审计。发消息失败不阻断退回。

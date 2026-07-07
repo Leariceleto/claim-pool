@@ -462,8 +462,8 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(detail["count"], 1)
         self.assertEqual(claim["status"], "accepted")
         self.assertEqual(payment["status"], "claimed")
-        self.assertEqual(payment["claimed_by_name"], "财务确认")
-        self.assertEqual(payment["finance_note"], "部分认领已确认完成")
+        self.assertIsNone(payment["claimed_by_name"])
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款")
         self.assertEqual(audit_row["action"], "accept_payment_claims")
 
     def test_cancel_my_claim_returns_payment_to_pending(self) -> None:
@@ -789,7 +789,73 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(audit_row["action"], "repair_rejected_payment_to_pending")
         self.assertEqual(audit_row["payment_id"], 1)
 
-    def test_submit_split_claims_creates_pending_lines_and_refreshes_payment(self) -> None:
+    def test_repair_pending_claims_converts_legacy_waiting_claims_to_accepted(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_department TEXT,
+                claimed_team TEXT,
+                claimed_by TEXT,
+                claimed_by_name TEXT,
+                claimed_at TEXT,
+                customer_project TEXT,
+                claim_note TEXT,
+                finance_note TEXT
+            );
+            CREATE TABLE claims (
+                id INTEGER PRIMARY KEY,
+                payment_id INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payment_id INTEGER,
+                detail_json TEXT NOT NULL,
+                ip TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (1, 199800, "pending_confirm"),
+        )
+        conn.executemany(
+            "INSERT INTO claims (id, payment_id, amount_cents, status) VALUES (?, ?, ?, ?)",
+            [(1, 1, 99900, "pending"), (2, 1, 99900, "pending")],
+        )
+
+        detail = self.app.repair_pending_claims_to_accepted(conn)
+
+        payment = conn.execute("SELECT status, claimed_by_name, finance_note FROM payments WHERE id = 1").fetchone()
+        claims = conn.execute("SELECT status FROM claims ORDER BY id").fetchall()
+        audit_row = conn.execute("SELECT action, payment_id FROM audit_logs").fetchone()
+
+        self.assertEqual(detail["payment_ids"], [1])
+        self.assertEqual(detail["claim_ids"], [1, 2])
+        self.assertEqual(payment["status"], "claimed")
+        self.assertIsNone(payment["claimed_by_name"])
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款")
+        self.assertEqual([row["status"] for row in claims], ["accepted", "accepted"])
+        self.assertEqual(audit_row["action"], "repair_pending_claims_to_accepted")
+        self.assertEqual(audit_row["payment_id"], 1)
+
+    def test_submit_split_claims_creates_accepted_lines_and_refreshes_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -867,15 +933,15 @@ class ExcelImportTests(unittest.TestCase):
 
         self.assertEqual(detail["count"], 2)
         self.assertEqual(detail["amount_cents"], 10000)
-        self.assertEqual(detail["payment_status"], "pending_confirm")
-        self.assertEqual(payment["status"], "pending_confirm")
-        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款，待管理员确认")
+        self.assertEqual(detail["payment_status"], "claimed")
+        self.assertEqual(payment["status"], "claimed")
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款")
         self.assertEqual([row["amount_cents"] for row in claim_rows], [6000, 4000])
-        self.assertEqual([row["status"] for row in claim_rows], ["pending", "pending"])
+        self.assertEqual([row["status"] for row in claim_rows], ["accepted", "accepted"])
         self.assertEqual([row["note"] for row in claim_rows], ["2本杂志", "2个参会名额"])
         self.assertEqual(audit_row["action"], "split_claim_submit")
 
-    def test_submit_batch_claims_creates_one_pending_claim_per_payment(self) -> None:
+    def test_submit_batch_claims_creates_one_accepted_claim_per_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -960,7 +1026,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(detail["count"], 2)
         self.assertEqual(detail["amount_cents"], 35000)
         self.assertEqual(detail["skipped"], [])
-        self.assertEqual([row["status"] for row in payments], ["pending_confirm", "pending_confirm"])
+        self.assertEqual([row["status"] for row in payments], ["claimed", "claimed"])
         self.assertTrue(all(row["claimed_department"] == department for row in payments))
         self.assertTrue(all(row["claimed_team"] == team for row in payments))
         self.assertTrue(all(row["claimed_by"] == "batch-user" for row in payments))
@@ -973,7 +1039,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertTrue(all(row["team"] == team for row in claims))
         self.assertTrue(all(row["customer_project"] == project for row in claims))
         self.assertEqual([row["note"] for row in claims], ["统一采购", "统一采购"])
-        self.assertEqual([row["status"] for row in claims], ["pending", "pending"])
+        self.assertEqual([row["status"] for row in claims], ["accepted", "accepted"])
         self.assertEqual(audit_row["action"], "batch_claim_submit")
         self.assertEqual(json.loads(audit_row["detail_json"])["payment_ids"], [1, 2])
 
@@ -1047,7 +1113,7 @@ class ExcelImportTests(unittest.TestCase):
             """
             INSERT INTO claims
                 (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'accepted', ?)
             """,
             (1, department, team, 3000, "other-user", "其他同事", project, "已认领部分", "2026-07-01 10:00:00"),
         )
@@ -1078,17 +1144,17 @@ class ExcelImportTests(unittest.TestCase):
                 {"payment_id": 999, "reason": "not_found"},
             ],
         )
-        self.assertEqual(payment["status"], "pending_confirm")
-        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款，待管理员确认")
-        self.assertEqual(payment["claimed_department"], "原部门")
-        self.assertEqual(payment["claimed_team"], "原中心")
-        self.assertEqual(payment["claimed_by"], "other-user")
-        self.assertEqual(payment["claimed_by_name"], "其他同事")
-        self.assertEqual(payment["customer_project"], "原项目")
-        self.assertEqual(payment["claim_note"], "原备注")
+        self.assertEqual(payment["status"], "claimed")
+        self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款")
+        self.assertEqual(payment["claimed_department"], "多部门分摊")
+        self.assertIsNone(payment["claimed_team"])
+        self.assertIsNone(payment["claimed_by"])
+        self.assertIsNone(payment["claimed_by_name"])
+        self.assertIsNone(payment["customer_project"])
+        self.assertIsNone(payment["claim_note"])
         self.assertEqual([row["amount_cents"] for row in claims], [3000, 7000])
         self.assertEqual(claims[-1]["actor_id"], "batch-user")
-        self.assertEqual(claims[-1]["status"], "pending")
+        self.assertEqual(claims[-1]["status"], "accepted")
 
     def test_search_pending_list_shows_unique_payment_ids(self) -> None:
         old_db_path = self.app.DB_PATH
@@ -1435,12 +1501,48 @@ class ExcelImportTests(unittest.TestCase):
 
                 response = self.app.admin_page(request)
                 html = response.body.decode("utf-8")
-                stat_section = html[html.index("admin-stat-grid"):html.index("当日数据导出")]
+                stat_section = html[html.index("admin-stat-grid"):html.index("按日期导出")]
 
                 self.assertIn("admin-stat-grid", stat_section)
                 self.assertNotIn("待财务确认", stat_section)
-                for label in ["待确认", "待认领", "部分认领中", "已确认", "已驳回", "已关闭"]:
+                for label in ["待确认", "待认领", "部分认领中", "已认领", "已驳回", "已关闭"]:
                     self.assertIn(label, stat_section)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_export_panel_uses_selected_date_controls(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-export-panel.db"
+                self.app.init_db()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.81"),
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.admin_page(request)
+                html = response.body.decode("utf-8")
+
+                self.assertIn("按日期导出", html)
+                self.assertIn('id="export-date" type="date"', html)
+                self.assertIn('id="export-date-csv"', html)
+                self.assertIn("下载 CSV", html)
+                self.assertIn("复制纯文本", html)
+                self.assertNotIn("下载今日 CSV", html)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
@@ -1673,6 +1775,129 @@ class ExcelImportTests(unittest.TestCase):
         self.assertNotIn("未认领客户", text)
         self.assertNotIn("已取消客户", text)
         self.assertNotIn("明日客户", text)
+
+    def test_admin_csv_export_uses_selected_date(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-date.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "目标客户", 10000, "目标备注", "蒲公英智库", "pending"),
+                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "其他客户", 20000, "其他备注", "蒲公英智库", "pending"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.82"),
+                    cookies={},
+                    query_params={"date": "2026-07-01"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_payments(request)
+                body = response.body.decode("utf-8-sig")
+
+                self.assertIn("目标客户", body)
+                self.assertIn("目标备注", body)
+                self.assertNotIn("其他客户", body)
+                self.assertEqual(response.headers["content-disposition"], 'attachment; filename="claim_pool_2026-07-01.csv"')
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_plain_text_export_uses_selected_date(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-text-date.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "目标客户", 10000, "目标备注", "蒲公英智库", "pending_confirm"),
+                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "其他客户", 20000, "其他备注", "蒲公英智库", "pending_confirm"),
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, "培训事业部", "会议中心", 10000, "claim-user", "张三", "项目A", "", "", "pending", "2026-07-01 10:05:00"),
+                            (2, "年会事业部", "创新中心", 20000, "claim-user-2", "李四", "项目B", "", "", "pending", "2026-07-02 10:05:00"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.83"),
+                    cookies={},
+                    query_params={"date": "2026-07-01"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_claim_plain_text(request)
+                body = response.body.decode("utf-8")
+
+                self.assertIn("7月1日", body)
+                self.assertIn("目标客户", body)
+                self.assertIn("项目A100.00元", body)
+                self.assertNotIn("其他客户", body)
+                self.assertNotIn("项目B", body)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
 
     def test_profile_setup_modal_only_for_authed_users_without_complete_profile(self) -> None:
         actor = {"id": "u1", "name": "测试用户", "role": "claimant", "authed": "1"}

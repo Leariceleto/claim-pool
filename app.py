@@ -380,6 +380,7 @@ def init_db() -> None:
             (now_text(),),
         )
         repair_rejected_payments_to_pending(conn)
+        repair_pending_claims_to_accepted(conn)
         refresh_catalog(conn)
 
 
@@ -1593,8 +1594,8 @@ def status_badge(status: str) -> str:
         "draft": "待确认入池",
         "pending": "待认领",
         "partial_claiming": "部分认领中",
-        "claimed": "已确认",
-        "pending_confirm": "待财务确认",
+        "claimed": "已认领",
+        "pending_confirm": "已认领",
         "rejected": "已驳回",
         "canceled": "已取消",
         "closed": "已关闭",
@@ -1818,7 +1819,7 @@ function confirmBulkClose() {
 COPY_TODAY_TEXT_JS = """
 function copyTextWithFallback(text, status) {
   function copied() {
-    if (status) status.textContent = '已复制今日纯文本。';
+    if (status) status.textContent = '已复制纯文本。';
   }
   function fallback() {
     var area = document.createElement('textarea');
@@ -1847,9 +1848,12 @@ document.addEventListener('DOMContentLoaded', function () {
   var status = document.getElementById('copy-today-plain-text-status');
   if (!button) return;
   button.addEventListener('click', function () {
+    var dateInput = document.getElementById('export-date');
+    var exportDate = dateInput && dateInput.value ? dateInput.value : '';
+    var url = '/admin/export/today-text' + (exportDate ? '?date=' + encodeURIComponent(exportDate) : '');
     button.disabled = true;
     if (status) status.textContent = '正在整理...';
-    fetch('/admin/export/today-text', {headers: {'X-Requested-With': 'fetch'}})
+    fetch(url, {headers: {'X-Requested-With': 'fetch'}})
       .then(function (response) {
         if (!response.ok) throw new Error('copy text export failed');
         return response.text();
@@ -1864,6 +1868,15 @@ document.addEventListener('DOMContentLoaded', function () {
         button.disabled = false;
       });
   });
+  var csvLink = document.getElementById('export-date-csv');
+  var dateInput = document.getElementById('export-date');
+  function syncExportLinks() {
+    if (!csvLink) return;
+    var exportDate = dateInput && dateInput.value ? dateInput.value : '';
+    csvLink.href = '/admin/export/today' + (exportDate ? '?date=' + encodeURIComponent(exportDate) : '');
+  }
+  if (dateInput) dateInput.addEventListener('change', syncExportLinks);
+  syncExportLinks();
 });
 """
 
@@ -2035,10 +2048,9 @@ def claim_summary_html(conn: sqlite3.Connection, row: sqlite3.Row, show_amount: 
         return ""
     remaining = max((row["amount_cents"] or 0) - totals["active"], 0)
     if not show_amount:
-        return '<div class="muted">已有部分认领，待财务确认</div>'
+        return '<div class="muted">已有部分认领</div>'
     return (
-        f'<div class="muted">已提交 ¥ {money(totals["active"])}'
-        f' · 待确认 ¥ {money(totals["pending"])}'
+        f'<div class="muted">已认领 ¥ {money(totals["active"])}'
         f' · 剩余 ¥ {money(remaining)}</div>'
     )
 
@@ -2168,7 +2180,7 @@ def submit_batch_claims(
             """
             INSERT INTO claims
                 (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'accepted', ?)
             """,
             (
                 payment_id,
@@ -2349,7 +2361,7 @@ def submit_split_claims(
             """
             INSERT INTO claims
                 (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'accepted', ?)
             """,
             (
                 payment_id,
@@ -2633,7 +2645,7 @@ def split_claim_page(request: Request, q: str = "") -> HTMLResponse:
           <div><button type="submit">搜索</button></div>
         </div>
       </form>
-      <p class="hint">适合一笔到款对应多个产品或多个部门归属的场景。每一行分摊会作为待财务确认的认领记录。</p>
+      <p class="hint">适合一笔到款对应多个产品或多个部门归属的场景。每一行分摊会作为已认领明细记录。</p>
     </div>
     {result_html}
     {catalog_script()}
@@ -2792,7 +2804,7 @@ def submit_claim(
         conflict = row["status"] in {"claimed", "pending_confirm"} and (
             (row["claimed_department"] or "") != department or (row["claimed_by"] or "") != actor["id"]
         )
-        claim_status = "accepted" if full_single_claim and not conflict else "pending"
+        claim_status = "accepted"
         conn.execute(
             """
             INSERT INTO claims
@@ -2815,12 +2827,7 @@ def submit_claim(
         )
 
         if not full_single_claim or conflict:
-            next_total = totals["active"] + requested_amount
-            next_status = "pending_confirm" if next_total >= row["amount_cents"] else "partial_claiming"
-            conn.execute(
-                "UPDATE payments SET status = ?, finance_note = ? WHERE id = ?",
-                (next_status, "存在部分认领，需要管理员确认分摊", payment_id),
-            )
+            refresh_payment_claim_status(conn, payment_id)
             action = "claim_partial_submit"
         else:
             conn.execute(
@@ -3324,7 +3331,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
     </div>
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
       <div class="stat" style="--dot:#16a34a"><span class="stat-label">已认领</span><strong>{accepted}</strong></div>
-      <div class="stat" style="--dot:#dc2626"><span class="stat-label">待管理员确认</span><strong>{waiting}</strong></div>
+      <div class="stat" style="--dot:#dc2626"><span class="stat-label">待处理</span><strong>{waiting}</strong></div>
       <div class="stat" style="--dot:#2456d6"><span class="stat-label">认领记录总数</span><strong>{len(my_claims)}</strong></div>
     </div>
     """
@@ -3340,7 +3347,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
         rows = []
         for r in my_claims:
             if r["c_status"] == "accepted":
-                state = '<span class="status claimed">已确认</span>'
+                state = '<span class="status claimed">已认领</span>'
             elif r["c_status"] == "pending":
                 state = status_badge("pending_confirm")
             elif r["c_status"] == "canceled":
@@ -3588,7 +3595,7 @@ def export_today_payments(request: Request) -> Response:
     rate_limit(request, "export")
     actor = actor_from_request(request)
     require_admin(actor)
-    today = datetime.now().strftime("%Y-%m-%d")
+    export_date = admin_export_date(request)
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -3600,9 +3607,9 @@ def export_today_payments(request: Request) -> Response:
             WHERE received_date = ?
             ORDER BY id DESC
             """,
-            (today,),
+            (export_date,),
         ).fetchall()
-        audit(conn, actor, "export_today_payments", None, {"date": today, "count": len(rows)}, request)
+        audit(conn, actor, "export_today_payments", None, {"date": export_date, "count": len(rows)}, request)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -3669,7 +3676,7 @@ def export_today_payments(request: Request) -> Response:
                     row["confirmed_at"],
                 ]
             )
-    filename = f"claim_pool_today_{today}.csv"
+    filename = f"claim_pool_{export_date}.csv"
     return Response(
         "\ufeff" + output.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -3683,6 +3690,19 @@ def plain_text_date_label(date_text: str) -> str:
     except ValueError:
         return date_text
     return f"{day.month}月{day.day}日"
+
+
+def admin_export_date(request: Request) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    raw_date = str(request.query_params.get("date", "") if hasattr(request, "query_params") else "").strip()
+    if not raw_date:
+        return today
+    parsed = parse_date(raw_date)
+    try:
+        datetime.strptime(parsed, "%Y-%m-%d")
+    except ValueError:
+        return today
+    return parsed
 
 
 def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> str:
@@ -3736,11 +3756,11 @@ def export_today_claim_plain_text(request: Request) -> Response:
     rate_limit(request, "export")
     actor = actor_from_request(request)
     require_admin(actor)
-    today = datetime.now().strftime("%Y-%m-%d")
+    export_date = admin_export_date(request)
     with get_conn() as conn:
-        text = build_today_claim_plain_text(conn, today)
+        text = build_today_claim_plain_text(conn, export_date)
         active_count = len([line for line in text.splitlines() if re.match(r"^\d+\.", line)])
-        audit(conn, actor, "export_today_claim_plain_text", None, {"date": today, "count": active_count}, request)
+        audit(conn, actor, "export_today_claim_plain_text", None, {"date": export_date, "count": active_count}, request)
     return Response(text, media_type="text/plain; charset=utf-8")
 
 
@@ -4035,11 +4055,12 @@ def admin_page(
             ("draft", "待确认", "#64748b"),
             ("pending", "待认领", "#d97706"),
             ("partial_claiming", "部分认领中", "#2456d6"),
-            ("claimed", "已确认", "#16a34a"),
+            ("claimed", "已认领", "#16a34a"),
             ("rejected", "已驳回", "#94a3b8"),
             ("closed", "已关闭", "#6366f1"),
         ]
     )
+    default_export_date = datetime.now().strftime("%Y-%m-%d")
 
     batch_rows = "".join(
         f"""
@@ -4142,11 +4163,14 @@ def admin_page(
     <div class="panel">
       <div class="row" style="justify-content:space-between; align-items:center">
         <div>
-          <div style="font-weight:600">当日数据导出</div>
-          <p class="hint" style="margin:4px 0 0">按到款日期导出今天的数据；CSV 可直接用 Excel 打开，纯文本用于发今日到款认领摘要。</p>
+          <div style="font-weight:600">按日期导出</div>
+          <p class="hint" style="margin:4px 0 0">选择到款日期后导出对应日期的数据；CSV 可直接用 Excel 打开，纯文本用于发到款认领摘要。</p>
         </div>
         <div class="row" style="gap:8px; align-items:center; justify-content:flex-end">
-          <a class="login-btn" href="/admin/export/today">下载今日 CSV</a>
+          <label class="muted" for="export-date" style="display:flex;align-items:center;gap:6px">到款日期
+            <input id="export-date" type="date" value="{esc(default_export_date)}" style="width:150px">
+          </label>
+          <a id="export-date-csv" class="login-btn" href="/admin/export/today?date={esc(default_export_date)}">下载 CSV</a>
           <button id="copy-today-plain-text" type="button" class="secondary">复制纯文本</button>
           <span id="copy-today-plain-text-status" class="muted"></span>
         </div>
@@ -4310,8 +4334,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
     if totals["active"] > 0:
         claimed += (
             f'<div class="muted">认领合计 ¥ {money(totals["active"])}'
-            f' · 已确认 ¥ {money(totals["accepted"])}'
-            f' · 待确认 ¥ {money(totals["pending"])}'
+            f' · 已认领 ¥ {money(totals["accepted"])}'
             f' · 剩余 ¥ {money(max((row["amount_cents"] or 0) - totals["active"], 0))}</div>'
         )
     finance_note = ""
@@ -4323,7 +4346,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
     claim_note_html = ""
     if claim_note_text:
         claim_note_html = f'<div class="muted">备注说明：{esc(claim_note_text)}</div>'
-    # 仅对已有人认领的单子（已确认/待财务确认）显示「驳回退回」
+    # 仅对已有人认领的单子显示「驳回退回」
     reject_ui = ""
     if row["status"] in {"claimed", "pending_confirm"}:
         reject_ui = f"""
@@ -4337,16 +4360,6 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
             </form>
           </div>
         </details>
-        """
-    pending_claim_count = sum(1 for claim in claim_rows if claim["status"] == "pending")
-    confirm_ui = ""
-    if pending_claim_count:
-        confirm_ui = f"""
-        <form class="confirm-claim-form" method="post" action="/admin/payments/{row['id']}/confirm-claims"
-              onsubmit="return confirm('确认这笔款的认领吗？')">
-          {finance_hidden(actor)}
-          <button class="success" type="submit">确认认领</button>
-        </form>
         """
     select_cell = (
         f'<td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row["id"]}" aria-label="选择流水 #{row["id"]}" {"disabled" if row["status"] == "closed" else ""}></td>'
@@ -4400,7 +4413,6 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
           </div>
         </details>
         {reject_ui}
-        {confirm_ui}
       </td>
     </tr>
     """
@@ -4410,8 +4422,7 @@ def status_options(current: str) -> str:
     items = [
         ("pending", "待认领"),
         ("partial_claiming", "部分认领中"),
-        ("claimed", "已确认"),
-        ("pending_confirm", "待财务确认"),
+        ("claimed", "已认领"),
         ("rejected", "已驳回"),
         ("closed", "已关闭"),
     ]
@@ -4664,6 +4675,15 @@ def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> N
     if not row:
         return
     totals = claim_totals(conn, payment_id)
+    active_claims = conn.execute(
+        """
+        SELECT *
+        FROM claims
+        WHERE payment_id = ? AND status IN ('pending', 'accepted')
+        ORDER BY id
+        """,
+        (payment_id,),
+    ).fetchall()
     if totals["active"] <= 0:
         conn.execute(
             """
@@ -4681,32 +4701,59 @@ def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> N
             """,
             (payment_id,),
         )
-    elif totals["accepted"] >= row["amount_cents"] and totals["pending"] == 0:
+    elif len(active_claims) == 1:
+        claim = active_claims[0]
+        claim_keys = set(claim.keys())
+        claimed_at = claim["created_at"] if "created_at" in claim_keys else now_text()
+        finance_note = "部分认领金额已覆盖整笔到款" if totals["active"] >= row["amount_cents"] else "存在部分认领，尚未认满"
         conn.execute(
             """
             UPDATE payments
-            SET status = 'claimed',
-                claimed_department = '多部门分摊',
-                claimed_team = NULL,
-                claimed_by = NULL,
-                claimed_by_name = '财务确认',
+            SET status = ?,
+                claimed_department = ?,
+                claimed_team = ?,
+                claimed_by = ?,
+                claimed_by_name = ?,
                 claimed_at = ?,
-                customer_project = NULL,
-                claim_note = NULL,
-                finance_note = '部分认领已确认完成'
+                customer_project = ?,
+                claim_note = ?,
+                finance_note = ?
             WHERE id = ?
             """,
-            (now_text(), payment_id),
-        )
-    elif totals["active"] >= row["amount_cents"]:
-        conn.execute(
-            "UPDATE payments SET status = 'pending_confirm', finance_note = ? WHERE id = ?",
-            ("部分认领金额已覆盖整笔到款，待管理员确认", payment_id),
+            (
+                "claimed" if totals["active"] >= row["amount_cents"] else "partial_claiming",
+                claim["department"] if "department" in claim_keys else row["claimed_department"],
+                claim["team"] if "team" in claim_keys else row["claimed_team"],
+                claim["actor_id"] if "actor_id" in claim_keys else row["claimed_by"],
+                claim["actor_name"] if "actor_name" in claim_keys else row["claimed_by_name"],
+                claimed_at,
+                claim["customer_project"] if "customer_project" in claim_keys else row["customer_project"],
+                claim["note"] if "note" in claim_keys else row["claim_note"],
+                finance_note,
+                payment_id,
+            ),
         )
     else:
         conn.execute(
-            "UPDATE payments SET status = 'partial_claiming', finance_note = ? WHERE id = ?",
-            ("存在部分认领，需要管理员确认分摊", payment_id),
+            """
+            UPDATE payments
+            SET status = ?,
+                claimed_department = '多部门分摊',
+                claimed_team = NULL,
+                claimed_by = NULL,
+                claimed_by_name = NULL,
+                claimed_at = ?,
+                customer_project = NULL,
+                claim_note = NULL,
+                finance_note = ?
+            WHERE id = ?
+            """,
+            (
+                "claimed" if totals["active"] >= row["amount_cents"] else "partial_claiming",
+                now_text(),
+                "部分认领金额已覆盖整笔到款" if totals["active"] >= row["amount_cents"] else "存在部分认领，尚未认满",
+                payment_id,
+            ),
         )
 
 
@@ -4824,6 +4871,41 @@ def repair_rejected_payments_to_pending(conn: sqlite3.Connection) -> dict[str, A
     return {"payment_ids": repaired_ids, "reset_claim_ids": reset_claim_ids}
 
 
+def repair_pending_claims_to_accepted(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT payment_id, GROUP_CONCAT(id) AS claim_ids, COALESCE(SUM(amount_cents), 0) AS amount_cents
+        FROM claims
+        WHERE status = 'pending'
+        GROUP BY payment_id
+        ORDER BY payment_id
+        """
+    ).fetchall()
+    repaired_payment_ids: list[int] = []
+    accepted_claim_ids: list[int] = []
+    for row in rows:
+        payment_id = int(row["payment_id"])
+        claim_ids = [int(value) for value in str(row["claim_ids"] or "").split(",") if value]
+        if not claim_ids:
+            continue
+        placeholders = ",".join("?" for _ in claim_ids)
+        conn.execute(
+            f"UPDATE claims SET status = 'accepted' WHERE id IN ({placeholders})",
+            claim_ids,
+        )
+        refresh_payment_claim_status(conn, payment_id)
+        audit(
+            conn,
+            {"id": "system", "name": "系统修复", "role": "system"},
+            "repair_pending_claims_to_accepted",
+            payment_id,
+            {"claim_ids": claim_ids, "amount_cents": int(row["amount_cents"] or 0)},
+        )
+        repaired_payment_ids.append(payment_id)
+        accepted_claim_ids.extend(claim_ids)
+    return {"payment_ids": repaired_payment_ids, "claim_ids": accepted_claim_ids}
+
+
 def cancel_my_claim(
     conn: sqlite3.Connection,
     actor: dict[str, str],
@@ -4867,11 +4949,11 @@ def accept_payment_claims(
         (payment_id,),
     ).fetchall()
     if not pending_claims:
-        raise HTTPException(status_code=409, detail="这笔款没有待确认认领")
+        raise HTTPException(status_code=409, detail="这笔款没有待处理认领")
     pending_amount = sum(int(claim["amount_cents"] or 0) for claim in pending_claims)
     accepted = claim_totals(conn, payment_id)["accepted"]
     if accepted + pending_amount > payment["amount_cents"]:
-        raise HTTPException(status_code=409, detail="确认后金额会超过到款金额")
+        raise HTTPException(status_code=409, detail="处理后金额会超过到款金额")
     claim_ids = [claim["id"] for claim in pending_claims]
     placeholders = ",".join("?" for _ in claim_ids)
     conn.execute(
@@ -4912,13 +4994,13 @@ def accept_claim(
         if not claim:
             raise HTTPException(status_code=404, detail="认领记录不存在")
         if claim["status"] != "pending":
-            raise HTTPException(status_code=409, detail="只有待确认认领可以确认")
+            raise HTTPException(status_code=409, detail="只有待处理认领可以处理")
         payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
         if not payment:
             raise HTTPException(status_code=404, detail="到款记录不存在")
         accepted = claim_totals(conn, claim["payment_id"])["accepted"]
         if accepted + claim["amount_cents"] > payment["amount_cents"]:
-            raise HTTPException(status_code=409, detail="确认后金额会超过到款金额")
+            raise HTTPException(status_code=409, detail="处理后金额会超过到款金额")
         conn.execute("UPDATE claims SET status = 'accepted' WHERE id = ?", (claim_id,))
         refresh_payment_claim_status(conn, claim["payment_id"])
         audit(
@@ -4944,7 +5026,7 @@ def reject_claim(
         if not claim:
             raise HTTPException(status_code=404, detail="认领记录不存在")
         if claim["status"] != "pending":
-            raise HTTPException(status_code=409, detail="只有待确认认领可以驳回")
+            raise HTTPException(status_code=409, detail="只有待处理认领可以驳回")
         payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
         notified = False
         if payment:
