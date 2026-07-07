@@ -1642,13 +1642,89 @@ class ExcelImportTests(unittest.TestCase):
                 order = [
                     "导入流水",
                     "到款认领搜索",
-                    "全量认领池",
                     "最近导入批次",
+                    "全量认领池",
                     "项目管理",
                     "成员部门",
                 ]
                 positions = [html.index(label) for label in order]
                 self.assertEqual(positions, sorted(positions))
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_page_progressively_reveals_batches_and_payment_pool(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-progressive.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (i, f"批次 {i}", f"2026-07-{i:02d} 10:00:00", "finance", "confirmed")
+                            for i in range(1, 13)
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                i,
+                                1,
+                                "2026-07-07 10:00:00",
+                                "2026-07-07 10:01:00",
+                                "2026-07-07",
+                                "10:00:00",
+                                f"测试客户{i}",
+                                10000 + i,
+                                "测试备注",
+                                "重庆市蒲公英未来科技有限公司",
+                                "pending",
+                            )
+                            for i in range(1, 26)
+                        ],
+                    )
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=None,
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.admin_page(request)
+                html = response.body.decode("utf-8")
+
+                batch_section = html[html.index("最近导入批次"):html.index("全量认领池")]
+                pool_section = html[html.index("全量认领池"):html.index("项目管理")]
+
+                self.assertEqual(batch_section.count('<tr data-progressive-group="admin-batches"'), 12)
+                self.assertEqual(batch_section.count('style="display:none"'), 2)
+                self.assertIn('data-progressive-step="10"', batch_section)
+                self.assertIn("显示更多", batch_section)
+                self.assertEqual(pool_section.count('<tr data-progressive-group="payment-pool"'), 25)
+                self.assertEqual(pool_section.count('style="display:none"'), 5)
+                self.assertIn('data-progressive-step="20"', pool_section)
+                self.assertIn("显示更多", pool_section)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path

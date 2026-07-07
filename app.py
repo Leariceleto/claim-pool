@@ -1892,7 +1892,7 @@ document.addEventListener('click', function (e) {
 
 BULK_ADMIN_JS = """
 function updateBulkCloseState() {
-  var boxes = Array.prototype.slice.call(document.querySelectorAll('.bulk-payment-checkbox:not(:disabled)'));
+  var boxes = visibleBulkPaymentBoxes();
   var checked = boxes.filter(function (box) { return box.checked; });
   var count = document.getElementById('bulk-selected-count');
   var button = document.getElementById('bulk-close-button');
@@ -1904,16 +1904,51 @@ function updateBulkCloseState() {
     all.indeterminate = checked.length > 0 && checked.length < boxes.length;
   }
 }
+function visibleBulkPaymentBoxes() {
+  return Array.prototype.slice.call(document.querySelectorAll('.bulk-payment-checkbox:not(:disabled)')).filter(function (box) {
+    var row = box.closest('tr');
+    return !row || row.style.display !== 'none';
+  });
+}
 document.addEventListener('change', function (e) {
   if (e.target.id === 'bulk-select-all') {
-    var boxes = document.querySelectorAll('.bulk-payment-checkbox:not(:disabled)');
+    var boxes = visibleBulkPaymentBoxes();
     boxes.forEach(function (box) { box.checked = e.target.checked; });
     updateBulkCloseState();
   } else if (e.target.classList.contains('bulk-payment-checkbox')) {
     updateBulkCloseState();
   }
 });
-document.addEventListener('DOMContentLoaded', updateBulkCloseState);
+function applyProgressiveTable(button) {
+  var group = button.dataset.progressiveGroup;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('[data-progressive-group="' + group + '"]'));
+  var visibleCount = parseInt(button.dataset.visibleCount || '0', 10);
+  rows.forEach(function (row, index) {
+    row.style.display = index < visibleCount ? '' : 'none';
+  });
+  var remaining = Math.max(rows.length - visibleCount, 0);
+  button.style.display = remaining > 0 ? '' : 'none';
+  button.textContent = remaining > 0 ? '显示更多（剩余 ' + remaining + ' 条）' : '已全部显示';
+}
+function initProgressiveTables() {
+  document.querySelectorAll('[data-progressive-more]').forEach(function (button) {
+    if (!button.dataset.visibleCount) {
+      button.dataset.visibleCount = button.dataset.initialCount || button.dataset.progressiveStep || '10';
+    }
+    applyProgressiveTable(button);
+  });
+  updateBulkCloseState();
+}
+document.addEventListener('DOMContentLoaded', initProgressiveTables);
+document.addEventListener('click', function (e) {
+  var button = e.target.closest('[data-progressive-more]');
+  if (!button) return;
+  var step = parseInt(button.dataset.progressiveStep || '10', 10);
+  var visibleCount = parseInt(button.dataset.visibleCount || button.dataset.initialCount || step, 10);
+  button.dataset.visibleCount = visibleCount + step;
+  applyProgressiveTable(button);
+  updateBulkCloseState();
+});
 document.addEventListener('click', function (e) {
   var link = e.target.closest('.sort-link');
   if (!link || !link.dataset.tableUrl) return;
@@ -1932,7 +1967,7 @@ document.addEventListener('click', function (e) {
     .then(function (html) {
       card.outerHTML = html;
       history.replaceState(null, '', link.href);
-      updateBulkCloseState();
+      initProgressiveTables();
     })
     .catch(function () {
       window.location.href = link.href;
@@ -4046,7 +4081,6 @@ def admin_payment_rows(
            OR COALESCE(closed_at, '') = ''
            OR closed_at > ?
         ORDER BY {payment_order}
-        LIMIT 100
         """,
         (closed_cutoff,),
     ).fetchall()
@@ -4077,7 +4111,25 @@ def render_payment_pool_html(
     sort: str,
     direction: str,
 ) -> str:
-    payment_rows = "".join(render_admin_payment_row(row, actor) for row in payments)
+    def progressive_payment_attrs(index: int) -> str:
+        hidden = ' style="display:none"' if index >= 20 else ""
+        return f' data-progressive-group="payment-pool"{hidden}'
+
+    payment_rows = "".join(
+        render_admin_payment_row(
+            row,
+            actor,
+            row_attrs=progressive_payment_attrs(index),
+        )
+        for index, row in enumerate(payments)
+    )
+    more_button = (
+        '<div style="padding:12px 0 0; text-align:center"><button type="button" class="secondary" '
+        'data-progressive-more data-progressive-group="payment-pool" data-progressive-step="20" '
+        'data-initial-count="20" data-visible-count="20">显示更多</button></div>'
+        if len(payments) > 20
+        else ""
+    )
     return f"""
     <div id="payment-pool-card" class="table-wrap">
     <div class="bulk-bar">
@@ -4101,6 +4153,7 @@ def render_payment_pool_html(
       </tr></thead>
       <tbody>{payment_rows or '<tr><td colspan="8" class="empty">暂无记录</td></tr>'}</tbody>
     </table>
+    {more_button}
     </div>
     """
 
@@ -4194,7 +4247,7 @@ def admin_page(
             GROUP BY status
             """
         ).fetchall()
-        batches = conn.execute("SELECT * FROM import_batches ORDER BY id DESC LIMIT 10").fetchall()
+        batches = conn.execute("SELECT * FROM import_batches ORDER BY id DESC").fetchall()
         payments, sort, dir = admin_payment_rows(conn, sort, dir)
         admin_search_results, admin_search_message = admin_claim_search_rows(conn, admin_q, actor, request)
         logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 30").fetchall()
@@ -4244,9 +4297,13 @@ def admin_page(
     )
     default_export_date = datetime.now().strftime("%Y-%m-%d")
 
+    def progressive_batch_attrs(index: int) -> str:
+        hidden = ' style="display:none"' if index >= 10 else ""
+        return f' data-progressive-group="admin-batches"{hidden}'
+
     batch_rows = "".join(
         f"""
-        <tr>
+        <tr{progressive_batch_attrs(index)}>
           <td class="nowrap">#{row['id']}</td>
           <td>{esc(row['source_name'])}</td>
           <td class="nowrap">{esc(row['created_at'])}</td>
@@ -4255,7 +4312,14 @@ def admin_page(
           <td>{render_batch_actions(row, actor)}</td>
         </tr>
         """
-        for row in batches
+        for index, row in enumerate(batches)
+    )
+    batch_more_button = (
+        '<div style="padding:12px 0 0; text-align:center"><button type="button" class="secondary" '
+        'data-progressive-more data-progressive-group="admin-batches" data-progressive-step="10" '
+        'data-initial-count="10" data-visible-count="10">显示更多</button></div>'
+        if len(batches) > 10
+        else ""
     )
 
     log_rows = "".join(
@@ -4384,16 +4448,17 @@ def admin_page(
 
     {render_admin_claim_search_panel(admin_q, admin_search_results, admin_search_message, actor)}
 
-    <h2>全量认领池</h2>
-    {render_payment_pool_html(payments, actor, sort, dir)}
-
     <h2>最近导入批次</h2>
     <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>来源</th><th>创建时间</th><th>原始 / 导入 / 跳过</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>{batch_rows or '<tr><td colspan="6" class="empty">暂无批次</td></tr>'}</tbody>
     </table>
+    {batch_more_button}
     </div>
+
+    <h2>全量认领池</h2>
+    {render_payment_pool_html(payments, actor, sort, dir)}
 
     <h2>项目管理</h2>
     <div class="panel">
@@ -4506,7 +4571,12 @@ def finance_hidden(actor: dict[str, str]) -> str:
     """
 
 
-def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable: bool = True) -> str:
+def render_admin_payment_row(
+    row: sqlite3.Row,
+    actor: dict[str, str],
+    selectable: bool = True,
+    row_attrs: str = "",
+) -> str:
     with get_conn() as conn:
         claim_rows = conn.execute(
             "SELECT * FROM claims WHERE payment_id = ? ORDER BY id",
@@ -4553,7 +4623,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
         else '<td class="select-cell col-select"></td>'
     )
     return f"""
-    <tr>
+    <tr{row_attrs}>
       {select_cell}
       <td class="nowrap col-id">#{row['id']}<br><span class="muted">批次 {esc(row['batch_id'])}</span></td>
       <td class="nowrap col-date">{esc(row['received_date'])}<br><span class="muted">{esc(row['received_time'])}</span></td>
