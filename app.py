@@ -462,6 +462,22 @@ def claim_note_summary(row: sqlite3.Row, claim_rows: list[sqlite3.Row]) -> str:
     return "；".join(notes)
 
 
+def admin_claim_details_html(row: sqlite3.Row, claim_rows: list[sqlite3.Row]) -> str:
+    active_claims = [claim for claim in claim_rows if claim["status"] in {"pending", "accepted"}]
+    if len(active_claims) <= 1:
+        return ""
+    lines: list[str] = []
+    for claim in active_claims:
+        department = str(claim["department"] or "").strip() or "未填写部门"
+        team = str(claim["team"] or "").strip() or "未填写中心"
+        project = str(claim["customer_project"] or "").strip() or "未填写项目"
+        actor_name = str(claim["actor_name"] or "").strip() or "未填写认领人"
+        lines.append(
+            f"{department} · {team} · {project} · {actor_name} · ¥ {money(claim['amount_cents'])}"
+        )
+    return '<div class="muted">认领明细：<br>' + "<br>".join(esc(line) for line in lines) + "</div>"
+
+
 def parse_amount(value: Any) -> int:
     text = str(value or "").strip()
     text = text.replace(",", "").replace("￥", "").replace("¥", "").replace("元", "")
@@ -919,6 +935,7 @@ BASE_CSS = """
     .status.closed { background:#e7e9fd; color:#4341c8; }
 
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:14px; margin-bottom:8px; }
+    .admin-stat-grid { grid-template-columns:repeat(6,minmax(0,1fr)); }
     .stat { background:var(--card); border:1px solid var(--line); border-radius:var(--radius);
       padding:16px 18px; box-shadow:var(--shadow); }
     .stat-label { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:7px; }
@@ -999,6 +1016,7 @@ BASE_CSS = """
       header { padding:10px 16px; }
       main { padding:20px 16px 48px; }
       .brand-text small { display:none; }
+      .admin-stat-grid { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
       table { min-width:680px; }
       .dash-table { min-width:0; }
     }
@@ -2478,6 +2496,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
                 f"""
                 <tr>
                   <td class="select-cell">{batch_claim_checkbox_html(conn, row)}</td>
+                  <td class="nowrap">#{esc(row["id"])}</td>
                   <td class="nowrap">{esc(row["received_date"])}</td>
                   <td class="num">¥ {money(row["amount_cents"])}</td>
                   <td>{esc(receiver_company_label(row["receiver_company"]))}</td>
@@ -2492,7 +2511,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
         table_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th class="select-cell"></th><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
+          <thead><tr><th class="select-cell"></th><th>ID</th><th>日期</th><th>金额</th><th>到款公司</th><th>付款方</th><th>银行备注</th><th>状态</th><th style="width:300px">认领</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         </div>
@@ -4017,7 +4036,6 @@ def admin_page(
             ("pending", "待认领", "#d97706"),
             ("partial_claiming", "部分认领中", "#2456d6"),
             ("claimed", "已确认", "#16a34a"),
-            ("pending_confirm", "待财务确认", "#dc2626"),
             ("rejected", "已驳回", "#94a3b8"),
             ("closed", "已关闭", "#6366f1"),
         ]
@@ -4119,7 +4137,7 @@ def admin_page(
 
     body = f"""
     {admin_notice_html(notice, imported, skipped)}
-    <div class="grid">{stat_html}</div>
+    <div class="grid admin-stat-grid">{stat_html}</div>
 
     <div class="panel">
       <div class="row" style="justify-content:space-between; align-items:center">
@@ -4154,6 +4172,19 @@ def admin_page(
       </form>
     </div>
 
+    {render_admin_claim_search_panel(admin_q, admin_search_results, admin_search_message, actor)}
+
+    <h2>全量认领池</h2>
+    {render_payment_pool_html(payments, actor, sort, dir)}
+
+    <h2>最近导入批次</h2>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>来源</th><th>创建时间</th><th>原始 / 导入 / 跳过</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>{batch_rows or '<tr><td colspan="6" class="empty">暂无批次</td></tr>'}</tbody>
+    </table>
+    </div>
+
     <h2>项目管理</h2>
     <div class="panel">
       <form method="post" action="/admin/catalog/projects" class="row" style="align-items:end">
@@ -4173,19 +4204,6 @@ def admin_page(
         <div><button class="danger" type="submit">删除项目</button></div>
       </form>
     </div>
-
-    <h2>最近导入批次</h2>
-    <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>来源</th><th>创建时间</th><th>原始 / 导入 / 跳过</th><th>状态</th><th>操作</th></tr></thead>
-      <tbody>{batch_rows or '<tr><td colspan="6" class="empty">暂无批次</td></tr>'}</tbody>
-    </table>
-    </div>
-
-    {render_admin_claim_search_panel(admin_q, admin_search_results, admin_search_message, actor)}
-
-    <h2>全量认领池</h2>
-    {render_payment_pool_html(payments, actor, sort, dir)}
 
     <h2>成员部门</h2>
     <p class="hint" style="margin:-4px 0 12px">登录过并设置过部门的成员都在这里。有人选错了，管理员可直接改。</p>
@@ -4281,7 +4299,7 @@ def finance_hidden(actor: dict[str, str]) -> str:
 def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable: bool = True) -> str:
     with get_conn() as conn:
         claim_rows = conn.execute(
-            "SELECT * FROM claims WHERE payment_id = ? ORDER BY id DESC",
+            "SELECT * FROM claims WHERE payment_id = ? ORDER BY id",
             (row["id"],),
         ).fetchall()
         totals = claim_totals(conn, row["id"])
@@ -4299,7 +4317,9 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
     finance_note = ""
     if row["finance_note"]:
         finance_note = f'<div class="muted">管理备注：{esc(row["finance_note"])}</div>'
-    claim_note_text = claim_note_summary(row, claim_rows)
+    active_claim_rows = [claim for claim in claim_rows if claim["status"] in {"pending", "accepted"}]
+    claim_details_html = admin_claim_details_html(row, claim_rows)
+    claim_note_text = claim_note_summary(row, active_claim_rows)
     claim_note_html = ""
     if claim_note_text:
         claim_note_html = f'<div class="muted">备注说明：{esc(claim_note_text)}</div>'
@@ -4343,6 +4363,7 @@ def render_admin_payment_row(row: sqlite3.Row, actor: dict[str, str], selectable
       <td class="payment-summary">
         <strong>{esc(row['payer_name'])}</strong>
         <div>{esc(row['bank_note'])}</div>
+        {claim_details_html}
         {claim_note_html}
       </td>
       <td class="col-status">{status_badge(row['status'])}{claimed}{finance_note}</td>
