@@ -1538,8 +1538,11 @@ class ExcelImportTests(unittest.TestCase):
                 html = response.body.decode("utf-8")
 
                 self.assertIn("按日期导出", html)
-                self.assertIn('id="export-date" type="date"', html)
+                self.assertIn('id="export-start-date" type="date"', html)
+                self.assertIn('id="export-end-date" type="date"', html)
                 self.assertIn('id="export-date-csv"', html)
+                self.assertIn("开始日期", html)
+                self.assertIn("结束日期", html)
                 self.assertIn("下载 CSV", html)
                 self.assertIn("复制纯文本", html)
                 self.assertNotIn("下载今日 CSV", html)
@@ -1895,6 +1898,142 @@ class ExcelImportTests(unittest.TestCase):
                 self.assertIn("项目A100.00元", body)
                 self.assertNotIn("其他客户", body)
                 self.assertNotIn("项目B", body)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_csv_export_uses_selected_date_range(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-date-range.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "区间外客户", 10000, "区间外备注", "蒲公英智库", "pending"),
+                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "区间客户A", 20000, "区间备注A", "蒲公英智库", "pending"),
+                            (3, 1, "2026-07-04 10:00:00", "2026-07-04 10:01:00", "2026-07-04", "10:00:00", "区间客户B", 30000, "区间备注B", "蒲公英智库", "pending"),
+                            (4, 1, "2026-07-05 10:00:00", "2026-07-05 10:01:00", "2026-07-05", "10:00:00", "区间后客户", 40000, "区间后备注", "蒲公英智库", "pending"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.84"),
+                    cookies={},
+                    query_params={"start_date": "2026-07-02", "end_date": "2026-07-04"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_payments(request)
+                body = response.body.decode("utf-8-sig")
+
+                self.assertIn("区间客户A", body)
+                self.assertIn("区间客户B", body)
+                self.assertNotIn("区间外客户", body)
+                self.assertNotIn("区间后客户", body)
+                self.assertEqual(
+                    response.headers["content-disposition"],
+                    'attachment; filename="claim_pool_2026-07-02_to_2026-07-04.csv"',
+                )
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_plain_text_export_uses_selected_date_range(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-text-range.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "区间外客户", 10000, "区间外备注", "蒲公英智库", "claimed"),
+                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "区间客户A", 20000, "区间备注A", "蒲公英智库", "claimed"),
+                            (3, 1, "2026-07-04 10:00:00", "2026-07-04 10:01:00", "2026-07-04", "10:00:00", "区间客户B", 30000, "区间备注B", "蒲公英智库", "claimed"),
+                            (4, 1, "2026-07-05 10:00:00", "2026-07-05 10:01:00", "2026-07-05", "10:00:00", "区间后客户", 40000, "区间后备注", "蒲公英智库", "claimed"),
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, "培训事业部", "会议中心", 10000, "claim-user", "张三", "区间外项目", "", "", "accepted", "2026-07-01 10:05:00"),
+                            (2, "培训事业部", "会议中心", 20000, "claim-user", "张三", "项目A", "", "", "accepted", "2026-07-02 10:05:00"),
+                            (3, "年会事业部", "创新中心", 30000, "claim-user-2", "李四", "项目B", "", "", "accepted", "2026-07-04 10:05:00"),
+                            (4, "年会事业部", "创新中心", 40000, "claim-user-2", "李四", "区间后项目", "", "", "accepted", "2026-07-05 10:05:00"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.85"),
+                    cookies={},
+                    query_params={"start_date": "2026-07-02", "end_date": "2026-07-04"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_claim_plain_text(request)
+                body = response.body.decode("utf-8")
+
+                self.assertIn("7月2日-7月4日", body)
+                self.assertIn("区间客户A", body)
+                self.assertIn("项目A200.00元", body)
+                self.assertIn("区间客户B", body)
+                self.assertIn("项目B300.00元", body)
+                self.assertIn("区间合计：500.00元", body)
+                self.assertNotIn("区间外客户", body)
+                self.assertNotIn("区间后客户", body)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path

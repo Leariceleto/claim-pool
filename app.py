@@ -1847,10 +1847,20 @@ document.addEventListener('DOMContentLoaded', function () {
   var button = document.getElementById('copy-today-plain-text');
   var status = document.getElementById('copy-today-plain-text-status');
   if (!button) return;
+  function exportRangeQuery() {
+    var startInput = document.getElementById('export-start-date');
+    var endInput = document.getElementById('export-end-date');
+    var startDate = startInput && startInput.value ? startInput.value : '';
+    var endDate = endInput && endInput.value ? endInput.value : startDate;
+    if (startDate && !endDate) endDate = startDate;
+    if (!startDate && endDate) startDate = endDate;
+    var params = [];
+    if (startDate) params.push('start_date=' + encodeURIComponent(startDate));
+    if (endDate) params.push('end_date=' + encodeURIComponent(endDate));
+    return params.length ? '?' + params.join('&') : '';
+  }
   button.addEventListener('click', function () {
-    var dateInput = document.getElementById('export-date');
-    var exportDate = dateInput && dateInput.value ? dateInput.value : '';
-    var url = '/admin/export/today-text' + (exportDate ? '?date=' + encodeURIComponent(exportDate) : '');
+    var url = '/admin/export/today-text' + exportRangeQuery();
     button.disabled = true;
     if (status) status.textContent = '正在整理...';
     fetch(url, {headers: {'X-Requested-With': 'fetch'}})
@@ -1869,13 +1879,14 @@ document.addEventListener('DOMContentLoaded', function () {
       });
   });
   var csvLink = document.getElementById('export-date-csv');
-  var dateInput = document.getElementById('export-date');
+  var startInput = document.getElementById('export-start-date');
+  var endInput = document.getElementById('export-end-date');
   function syncExportLinks() {
     if (!csvLink) return;
-    var exportDate = dateInput && dateInput.value ? dateInput.value : '';
-    csvLink.href = '/admin/export/today' + (exportDate ? '?date=' + encodeURIComponent(exportDate) : '');
+    csvLink.href = '/admin/export/today' + exportRangeQuery();
   }
-  if (dateInput) dateInput.addEventListener('change', syncExportLinks);
+  if (startInput) startInput.addEventListener('change', syncExportLinks);
+  if (endInput) endInput.addEventListener('change', syncExportLinks);
   syncExportLinks();
 });
 """
@@ -3595,7 +3606,7 @@ def export_today_payments(request: Request) -> Response:
     rate_limit(request, "export")
     actor = actor_from_request(request)
     require_admin(actor)
-    export_date = admin_export_date(request)
+    start_date, end_date = admin_export_range(request)
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -3604,12 +3615,19 @@ def export_today_payments(request: Request) -> Response:
                    customer_project, claimed_by_name, claimed_at, claim_note, finance_note,
                    source_ref, imported_at, confirmed_at
             FROM payments
-            WHERE received_date = ?
-            ORDER BY id DESC
+            WHERE received_date BETWEEN ? AND ?
+            ORDER BY received_date DESC, id DESC
             """,
-            (export_date,),
+            (start_date, end_date),
         ).fetchall()
-        audit(conn, actor, "export_today_payments", None, {"date": export_date, "count": len(rows)}, request)
+        audit(
+            conn,
+            actor,
+            "export_today_payments",
+            None,
+            {"start_date": start_date, "end_date": end_date, "count": len(rows)},
+            request,
+        )
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -3676,7 +3694,7 @@ def export_today_payments(request: Request) -> Response:
                     row["confirmed_at"],
                 ]
             )
-    filename = f"claim_pool_{export_date}.csv"
+    filename = f"claim_pool_{start_date}.csv" if start_date == end_date else f"claim_pool_{start_date}_to_{end_date}.csv"
     return Response(
         "\ufeff" + output.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -3692,36 +3710,63 @@ def plain_text_date_label(date_text: str) -> str:
     return f"{day.month}月{day.day}日"
 
 
-def admin_export_date(request: Request) -> str:
+def plain_text_range_label(start_date: str, end_date: str) -> str:
+    if start_date == end_date:
+        return plain_text_date_label(start_date)
+    return f"{plain_text_date_label(start_date)}-{plain_text_date_label(end_date)}"
+
+
+def admin_export_range(request: Request) -> tuple[str, str]:
     today = datetime.now().strftime("%Y-%m-%d")
-    raw_date = str(request.query_params.get("date", "") if hasattr(request, "query_params") else "").strip()
-    if not raw_date:
-        return today
-    parsed = parse_date(raw_date)
+    params = request.query_params if hasattr(request, "query_params") else {}
+    raw_date = str(params.get("date", "")).strip()
+    raw_start = str(params.get("start_date", "")).strip()
+    raw_end = str(params.get("end_date", "")).strip()
+    if raw_date and not raw_start and not raw_end:
+        raw_start = raw_date
+        raw_end = raw_date
+    if raw_start and not raw_end:
+        raw_end = raw_start
+    if raw_end and not raw_start:
+        raw_start = raw_end
+    if not raw_start and not raw_end:
+        raw_start = today
+        raw_end = today
+
+    start_date = parse_date(raw_start)
+    end_date = parse_date(raw_end)
     try:
-        datetime.strptime(parsed, "%Y-%m-%d")
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
     except ValueError:
-        return today
-    return parsed
+        raise HTTPException(status_code=400, detail="导出日期格式不正确")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="结束日期不能早于开始日期")
+    return start_date, end_date
 
 
 def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> str:
+    return build_claim_plain_text(conn, date_text, date_text)
+
+
+def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: str) -> str:
     rows = conn.execute(
         """
         SELECT
             p.id AS payment_id,
+            p.received_date AS received_date,
             p.payer_name AS payer_name,
             c.department AS department,
             c.customer_project AS customer_project,
             c.amount_cents AS amount_cents
         FROM payments p
         JOIN claims c ON c.payment_id = p.id
-        WHERE p.received_date = ?
+        WHERE p.received_date BETWEEN ? AND ?
           AND p.status != 'closed'
           AND c.status IN ('pending', 'accepted')
-        ORDER BY p.id, c.id
+        ORDER BY p.received_date, p.id, c.id
         """,
-        (date_text,),
+        (start_date, end_date),
     ).fetchall()
 
     payer_items: dict[str, dict[str, Any]] = {}
@@ -3738,7 +3783,7 @@ def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> st
         dept_items = payer_item["departments"].setdefault(department, {})
         dept_items[project] = dept_items.get(project, 0) + amount_cents
 
-    lines = [plain_text_date_label(date_text), ""]
+    lines = [plain_text_range_label(start_date, end_date), ""]
     grand_total = 0
     for index, (payer, item) in enumerate(payer_items.items(), start=1):
         grand_total += item["total"]
@@ -3747,7 +3792,8 @@ def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> st
             project_parts = [f"{project}{money(amount)}元" for project, amount in projects.items()]
             department_parts.append(f"{department}  {'，'.join(project_parts)}")
         lines.append(f"{index}.{payer}\t{money(item['total'])}元（{'；'.join(department_parts)}）")
-    lines.append(f"今日合计：{money(grand_total)}元")
+    total_label = "今日合计" if start_date == end_date else "区间合计"
+    lines.append(f"{total_label}：{money(grand_total)}元")
     return "\n".join(lines)
 
 
@@ -3756,11 +3802,18 @@ def export_today_claim_plain_text(request: Request) -> Response:
     rate_limit(request, "export")
     actor = actor_from_request(request)
     require_admin(actor)
-    export_date = admin_export_date(request)
+    start_date, end_date = admin_export_range(request)
     with get_conn() as conn:
-        text = build_today_claim_plain_text(conn, export_date)
+        text = build_claim_plain_text(conn, start_date, end_date)
         active_count = len([line for line in text.splitlines() if re.match(r"^\d+\.", line)])
-        audit(conn, actor, "export_today_claim_plain_text", None, {"date": export_date, "count": active_count}, request)
+        audit(
+            conn,
+            actor,
+            "export_today_claim_plain_text",
+            None,
+            {"start_date": start_date, "end_date": end_date, "count": active_count},
+            request,
+        )
     return Response(text, media_type="text/plain; charset=utf-8")
 
 
@@ -4164,13 +4217,17 @@ def admin_page(
       <div class="row" style="justify-content:space-between; align-items:center">
         <div>
           <div style="font-weight:600">按日期导出</div>
-          <p class="hint" style="margin:4px 0 0">选择到款日期后导出对应日期的数据；CSV 可直接用 Excel 打开，纯文本用于发到款认领摘要。</p>
+          <p class="hint" style="margin:4px 0 0">选择到款日期范围后导出对应区间的数据；CSV 可直接用 Excel 打开，纯文本用于发到款认领摘要。</p>
         </div>
         <div class="row" style="gap:8px; align-items:center; justify-content:flex-end">
-          <label class="muted" for="export-date" style="display:flex;align-items:center;gap:6px">到款日期
-            <input id="export-date" type="date" value="{esc(default_export_date)}" style="width:150px">
+          <label class="muted" for="export-start-date" style="display:flex;align-items:center;gap:6px">开始日期
+            <input id="export-start-date" type="date" value="{esc(default_export_date)}" style="width:150px">
           </label>
-          <a id="export-date-csv" class="login-btn" href="/admin/export/today?date={esc(default_export_date)}">下载 CSV</a>
+          <span class="muted">至</span>
+          <label class="muted" for="export-end-date" style="display:flex;align-items:center;gap:6px">结束日期
+            <input id="export-end-date" type="date" value="{esc(default_export_date)}" style="width:150px">
+          </label>
+          <a id="export-date-csv" class="login-btn" href="/admin/export/today?start_date={esc(default_export_date)}&amp;end_date={esc(default_export_date)}">下载 CSV</a>
           <button id="copy-today-plain-text" type="button" class="secondary">复制纯文本</button>
           <span id="copy-today-plain-text-status" class="muted"></span>
         </div>
