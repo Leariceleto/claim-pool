@@ -1210,6 +1210,69 @@ class ExcelImportTests(unittest.TestCase):
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
 
+    def test_run_search_returns_all_matching_rows_without_limit(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
+                amount_cents INTEGER,
+                bank_note TEXT,
+                serial_no TEXT,
+                status TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO payments (id, received_date, payer_name, amount_cents, bank_note, serial_no, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (i, "2026-07-03", f"银联POS款客户{i}", 10000 + i, "银联POS款", f"POS{i:03d}", "pending")
+                for i in range(1, 13)
+            ],
+        )
+
+        rows = self.app.run_search(conn, "银联POS款")
+
+        self.assertEqual(len(rows), 12)
+
+    def test_project_select_uses_keyword_input_with_existing_project_options(self) -> None:
+        department = next(dept for dept, teams in self.app.CATALOG.items() if teams)
+        team = next(team for team, projects in self.app.CATALOG[department].items() if projects)
+        project = self.app.CATALOG[department][team][0]
+
+        html = self.app.project_select("customer_project", department, team, project, required=True)
+
+        self.assertIn('name="customer_project"', html)
+        self.assertIn('class="cs-project"', html)
+        self.assertIn('placeholder="输入项目关键词"', html)
+        self.assertIn('required', html)
+        self.assertIn("<datalist", html)
+        self.assertIn(f'value="{project}"', html)
+        self.assertIn(f'<option value="{project}"></option>', html)
+        self.assertNotIn("<select", html)
+
+    def test_split_claim_form_can_add_more_rows_client_side(self) -> None:
+        row = {
+            "id": 66,
+            "amount_cents": 1016800,
+            "status": "pending",
+        }
+
+        html = self.app.split_claim_form_html(row)
+
+        self.assertEqual(html.count('name="departments"'), 6)
+        self.assertEqual(html.count('class="split-row-number"'), 6)
+        self.assertIn('class="secondary split-add-row"', html)
+        self.assertIn("＋ 添加分摊行", html)
+        self.assertIn("addSplitClaimRow", self.app.CASCADE_JS)
+        self.assertIn("createProjectInput", self.app.CASCADE_JS)
+
     def test_admin_payment_sort_clause_is_whitelisted(self) -> None:
         clause, sort, direction = self.app.admin_payment_order_clause("amount", "asc")
         self.assertEqual(sort, "amount")

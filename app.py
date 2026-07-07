@@ -44,7 +44,6 @@ load_dotenv(APP_DIR / ".env")
 
 DB_PATH = Path(os.environ.get("CLAIM_POOL_DB", APP_DIR / "claim_pool.db"))
 UPLOAD_DIR = Path(os.environ.get("CLAIM_UPLOAD_DIR", APP_DIR / "uploads"))
-SEARCH_LIMIT = 10
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 ALLOWED_ATTACHMENT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf", ".csv", ".xls", ".xlsx"}
 BROAD_TERMS = {"公司", "有限公司", "集团", "科技", "教育", "转账", "付款", "收入"}
@@ -1637,12 +1636,15 @@ def team_select(name: str, department: str, selected: str = "", required: bool =
 def project_select(name: str, department: str, team: str, selected: str = "", required: bool = False) -> str:
     projects = CATALOG.get(department, {}).get(team, [])
     selected = selected if selected in projects else ""
-    placeholder = "请选择项目" if projects else "请先选择中心/小组"
+    placeholder = "输入项目关键词" if projects else "请先选择中心/小组"
     req = " required" if required else ""
-    options = [f'<option value="">{placeholder}</option>'] + [
-        f'<option value="{esc(p)}"{" selected" if p == selected else ""}>{esc(p)}</option>' for p in projects
-    ]
-    return f'<select name="{esc(name)}" class="cs-project"{req}>{"".join(options)}</select>'
+    list_id = f"project-options-{uuid.uuid4().hex}"
+    options = "".join(f'<option value="{esc(p)}"></option>' for p in projects)
+    return (
+        f'<input name="{esc(name)}" class="cs-project" value="{esc(selected)}" '
+        f'list="{list_id}" placeholder="{esc(placeholder)}" autocomplete="off"{req}>'
+        f'<datalist id="{list_id}">{options}</datalist>'
+    )
 
 
 def require_department(department: str) -> str:
@@ -1747,17 +1749,144 @@ function fillSelect(sel, items, placeholder) {
     sel.appendChild(o);
   }
 }
+function fillProjectInput(input, items, placeholder) {
+  if (!input) return;
+  input.value = '';
+  input.placeholder = placeholder;
+  input.setCustomValidity('');
+  var listId = input.getAttribute('list');
+  var list = listId ? document.getElementById(listId) : null;
+  if (!list) return;
+  list.innerHTML = '';
+  for (var i = 0; i < items.length; i++) {
+    var o = document.createElement('option');
+    o.value = items[i];
+    list.appendChild(o);
+  }
+}
+function projectInputHasKnownValue(input) {
+  var value = (input.value || '').trim();
+  if (!value) return !input.required;
+  var listId = input.getAttribute('list');
+  var list = listId ? document.getElementById(listId) : null;
+  if (!list) return true;
+  return Array.prototype.some.call(list.options, function (opt) {
+    return opt.value === value;
+  });
+}
+function validateProjectInput(input) {
+  if (!input || !input.classList.contains('cs-project')) return true;
+  if (projectInputHasKnownValue(input)) {
+    input.setCustomValidity('');
+    return true;
+  }
+  input.setCustomValidity('请选择已有项目');
+  return false;
+}
 document.addEventListener('change', function (e) {
   var scope = e.target.closest('.cascade-scope') || e.target.closest('form');
   if (!scope) return;
   if (e.target.classList.contains('cs-dept')) {
     fillSelect(scope.querySelector('.cs-team'), Object.keys(CATALOG[e.target.value] || {}), '请选择中心/小组');
-    fillSelect(scope.querySelector('.cs-project'), [], '请先选择中心/小组');
+    fillProjectInput(scope.querySelector('.cs-project'), [], '请先选择中心/小组');
   } else if (e.target.classList.contains('cs-team')) {
     var deptInput = scope.querySelector('.cs-dept');
     var dept = deptInput ? deptInput.value : '';
-    fillSelect(scope.querySelector('.cs-project'), (CATALOG[dept] || {})[e.target.value] || [], '请选择项目');
+    fillProjectInput(scope.querySelector('.cs-project'), (CATALOG[dept] || {})[e.target.value] || [], '输入项目关键词');
   }
+});
+document.addEventListener('input', function (e) {
+  if (e.target.classList.contains('cs-project')) {
+    validateProjectInput(e.target);
+  }
+});
+document.addEventListener('submit', function (e) {
+  var inputs = Array.prototype.slice.call(e.target.querySelectorAll('.cs-project'));
+  var invalid = inputs.find(function (input) { return !validateProjectInput(input); });
+  if (invalid) {
+    invalid.reportValidity();
+    e.preventDefault();
+  }
+});
+function createCascadeSelect(name, className, placeholder, items) {
+  var select = document.createElement('select');
+  select.name = name;
+  select.className = className;
+  var blank = document.createElement('option');
+  blank.value = '';
+  blank.textContent = placeholder;
+  select.appendChild(blank);
+  for (var i = 0; i < items.length; i++) {
+    var option = document.createElement('option');
+    option.value = items[i];
+    option.textContent = items[i];
+    select.appendChild(option);
+  }
+  return select;
+}
+function createProjectInput() {
+  var id = 'project-options-added-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+  var input = document.createElement('input');
+  input.name = 'projects';
+  input.className = 'cs-project';
+  input.setAttribute('list', id);
+  input.placeholder = '请先选择中心/小组';
+  input.autocomplete = 'off';
+  var list = document.createElement('datalist');
+  list.id = id;
+  return { input: input, list: list };
+}
+function refreshSplitRowNumbers(tbody) {
+  Array.prototype.forEach.call(tbody.querySelectorAll('.split-row-number'), function (cell, index) {
+    cell.textContent = index + 1;
+  });
+}
+function addSplitClaimRow(button) {
+  var form = button.closest('form');
+  var tbody = form ? form.querySelector('.split-form-table tbody') : null;
+  if (!tbody) return;
+  var row = document.createElement('tr');
+  row.className = 'cascade-scope';
+
+  var numberCell = document.createElement('td');
+  numberCell.className = 'split-row-number';
+  row.appendChild(numberCell);
+
+  var deptCell = document.createElement('td');
+  deptCell.appendChild(createCascadeSelect('departments', 'cs-dept', '请选择部门', Object.keys(CATALOG || {})));
+  row.appendChild(deptCell);
+
+  var teamCell = document.createElement('td');
+  teamCell.appendChild(createCascadeSelect('teams', 'cs-team', '请先选择部门', []));
+  row.appendChild(teamCell);
+
+  var projectCell = document.createElement('td');
+  var project = createProjectInput();
+  projectCell.appendChild(project.input);
+  projectCell.appendChild(project.list);
+  row.appendChild(projectCell);
+
+  var amountCell = document.createElement('td');
+  var amountInput = document.createElement('input');
+  amountInput.name = 'amounts';
+  amountInput.placeholder = '0.00';
+  amountCell.appendChild(amountInput);
+  row.appendChild(amountCell);
+
+  var noteCell = document.createElement('td');
+  var noteInput = document.createElement('input');
+  noteInput.name = 'notes';
+  noteInput.placeholder = '如：2本杂志 / 3个笔记本 / 2个参会名额';
+  noteCell.appendChild(noteInput);
+  row.appendChild(noteCell);
+
+  tbody.appendChild(row);
+  refreshSplitRowNumbers(tbody);
+}
+document.addEventListener('click', function (e) {
+  var button = e.target.closest('.split-add-row');
+  if (!button) return;
+  addSplitClaimRow(button);
 });
 """
 
@@ -2257,7 +2386,7 @@ def split_claim_line_rows(count: int = 6) -> str:
         rows.append(
             f"""
             <tr class="cascade-scope">
-              <td>{index + 1}</td>
+              <td class="split-row-number">{index + 1}</td>
               <td>{department_select("departments", required=False, class_name="cs-dept")}</td>
               <td>{team_select("teams", "", required=False)}</td>
               <td>{project_select("projects", "", "", required=False)}</td>
@@ -2285,6 +2414,7 @@ def split_claim_form_html(row: sqlite3.Row) -> str:
               <tbody>{split_claim_line_rows()}</tbody>
             </table>
           </div>
+          <button type="button" class="secondary split-add-row" style="margin:0 0 12px">＋ 添加分摊行</button>
           <p class="hint" style="margin:0 0 12px">只填写需要分摊的行；分摊金额合计不能超过该笔款剩余可认领金额。</p>
           <button type="submit">提交分摊认领</button>
         </form>
@@ -2567,7 +2697,7 @@ def search_page(request: Request, q: str = "", pending_date: str = "") -> HTMLRe
           <div><button type="submit">搜索</button></div>
         </div>
       </form>
-      <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
+      <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制；可输入客户名、金额或备注组合搜索。</p>
     </div>
     {batch_claim_panel_html(actor)}
     {result_html}
@@ -2752,7 +2882,6 @@ def run_search(conn: sqlite3.Connection, q: str) -> list[sqlite3.Row]:
         WHERE status IN ('pending', 'partial_claiming', 'claimed', 'pending_confirm')
           AND {where}
         ORDER BY received_date DESC, id DESC
-        LIMIT {SEARCH_LIMIT}
         """,
         params,
     ).fetchall()
@@ -4024,7 +4153,7 @@ def render_admin_claim_search_panel(
           <div><button type="submit">搜索</button></div>
           {f'<div>{clear_link}</div>' if clear_link else ''}
         </div>
-        <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制，单次最多返回 {SEARCH_LIMIT} 条。</p>
+        <p class="hint">空搜索、过宽关键词、单独日期搜索会被限制；可输入客户名、金额或备注组合搜索。</p>
       </form>
       {result_html}
     </div>
