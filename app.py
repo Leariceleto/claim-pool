@@ -3661,7 +3661,7 @@ def export_today_payments(request: Request) -> Response:
     for row in rows:
         with get_conn() as conn:
             claim_rows = conn.execute(
-                "SELECT * FROM claims WHERE payment_id = ? ORDER BY id",
+                "SELECT * FROM claims WHERE payment_id = ? AND status IN ('pending', 'accepted') ORDER BY id",
                 (row["id"],),
             ).fetchall()
         if not claim_rows:

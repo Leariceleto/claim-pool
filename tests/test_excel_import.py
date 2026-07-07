@@ -1834,6 +1834,76 @@ class ExcelImportTests(unittest.TestCase):
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
 
+    def test_admin_csv_export_skips_rejected_claim_history(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-active-claims.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (30, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "深圳市龙岗区龙岭初级中学", 480600, "班主任峰会+龙岭初级中学+线下+3人+培训费", "蒲公英智库", "claimed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (id, payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (15, 30, "培训事业部", "产品中心", 480600, "old-user", "旧认领人", "旧项目", "", "驳回前", "rejected", "2026-07-02 10:05:00"),
+                            (19, 30, "培训事业部", "产品中心", 480600, "old-user", "旧认领人", "旧项目", "", "驳回前2", "rejected", "2026-07-02 10:06:00"),
+                            (51, 30, "中台战略委员会", "整合服务中台", 480600, "new-user", "新认领人", "新项目", "", "最终认领", "accepted", "2026-07-02 11:00:00"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.86"),
+                    cookies={},
+                    query_params={"date": "2026-07-02"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_payments(request)
+                body = response.body.decode("utf-8-sig")
+                rows = [line for line in body.splitlines() if "深圳市龙岗区龙岭初级中学" in line]
+
+                self.assertEqual(len(rows), 1)
+                self.assertIn(",51,", rows[0])
+                self.assertIn("accepted", rows[0])
+                self.assertIn("中台战略委员会", rows[0])
+                self.assertIn("最终认领", rows[0])
+                self.assertNotIn("rejected", body)
+                self.assertNotIn("旧认领人", body)
+                self.assertNotIn("驳回前", body)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
     def test_admin_plain_text_export_uses_selected_date(self) -> None:
         old_db_path = self.app.DB_PATH
         old_actor_from_request = self.app.actor_from_request
