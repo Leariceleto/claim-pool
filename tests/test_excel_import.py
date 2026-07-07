@@ -1649,10 +1649,125 @@ class ExcelImportTests(unittest.TestCase):
                     "最近导入批次",
                     "全量认领池",
                     "项目管理",
-                    "成员部门",
                 ]
                 positions = [html.index(label) for label in order]
                 self.assertEqual(positions, sorted(positions))
+                self.assertIn("财务后台", html)
+                self.assertNotIn("成员部门", html)
+                self.assertNotIn("身份管理", html)
+                self.assertNotIn("最近操作日志", html)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_system_page_is_superadmin_only_and_contains_system_sections(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-system.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO user_profiles (open_id, name, department, team, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        ("user-1", "成员甲", "培训事业部", "会议中心", "2026-07-07 10:00:00"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO app_users (open_id, name, managed_role, is_admin, created_at, last_login)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        ("user-1", "成员甲", "admin", 1, "2026-07-07 09:00:00", "2026-07-07 10:00:00"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO audit_logs (at, actor_id, actor_name, actor_role, action, payment_id, detail_json, ip)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ("2026-07-07 11:00:00", "super", "超级管理员", "superadmin", "set_user_role", None, "{}", "127.0.0.1"),
+                    )
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=None,
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                with self.assertRaises(self.app.HTTPException):
+                    self.app.admin_system_page(request)
+
+                self.app.actor_from_request = lambda request: {
+                    "id": "super",
+                    "name": "超级管理员",
+                    "role": "superadmin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                response = self.app.admin_system_page(request)
+                html = response.body.decode("utf-8")
+
+                self.assertIn("管理后台", html)
+                self.assertIn("成员部门", html)
+                self.assertIn("身份管理", html)
+                self.assertIn("最近操作日志", html)
+                self.assertIn("成员甲", html)
+                self.assertIn("set_user_role", html)
+                self.assertIn("/admin/system", html)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_scope_changes_require_superadmin(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "admin-scope-permission.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO user_profiles (open_id, name, department, team, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        ("user-1", "成员甲", "培训事业部", "会议中心", "2026-07-07 10:00:00"),
+                    )
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.89"),
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                with self.assertRaises(self.app.HTTPException):
+                    self.app.admin_add_user_scope(
+                        request,
+                        "user-1",
+                        department="培训事业部",
+                        team="会议中心",
+                        label="测试范围",
+                    )
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path

@@ -1073,9 +1073,11 @@ def page(
         (split_href, "分摊认领", "split"),
         (me_href, "个人中心", "me"),
     ]
-    # 管理后台仅对真实管理员可见；不再用 ?role=admin 给所有人埋后门入口
+    # 后台仅对真实管理员可见；不再用 ?role=admin 给所有人埋后门入口
     if actor and actor["role"] in {"finance", "admin", "superadmin"}:
-        nav_items.append((url("/admin", **ident), "管理后台", "admin"))
+        nav_items.append((url("/admin", **ident), "财务后台", "admin"))
+    if actor and actor["role"] == "superadmin":
+        nav_items.append((url("/admin/system", **ident), "管理后台", "system"))
     nav = "".join(
         f'<a href="{esc(href)}" class="{"active" if key == active else ""}">{label}</a>'
         for href, label, key in nav_items
@@ -3666,7 +3668,7 @@ def admin_set_profile(
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="成员不存在")
         audit(conn, actor, "admin_set_profile", None, {"open_id": open_id, "department": department, "team": team}, request)
-    return RedirectResponse("/admin", status_code=303)
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 @app.post("/admin/scopes/{open_id}/add")
@@ -3678,7 +3680,7 @@ def admin_add_user_scope(
     label: str = Form(""),
 ) -> RedirectResponse:
     actor = actor_from_request(request)
-    require_admin(actor)
+    require_superadmin(actor)
     department = require_department(department)
     team = team.strip()
     label = label.strip()
@@ -3713,13 +3715,13 @@ def admin_add_user_scope(
             {"open_id": open_id, "department": department, "team": team, "label": label},
             request,
         )
-    return RedirectResponse("/admin", status_code=303)
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 @app.post("/admin/scopes/{scope_id}/deactivate")
 def admin_deactivate_user_scope(request: Request, scope_id: int) -> RedirectResponse:
     actor = actor_from_request(request)
-    require_admin(actor)
+    require_superadmin(actor)
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM user_scopes WHERE id = ?", (scope_id,)).fetchone()
         if not row:
@@ -3736,7 +3738,7 @@ def admin_deactivate_user_scope(request: Request, scope_id: int) -> RedirectResp
             {"scope_id": scope_id, "open_id": row["open_id"], "department": row["department"], "team": row["team"] or ""},
             request,
         )
-    return RedirectResponse("/admin", status_code=303)
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 @app.post("/admin/admins/{open_id}")
@@ -3760,7 +3762,7 @@ def admin_toggle_admin(
             (is_admin, "admin" if is_admin else "claimant", open_id),
         )
         audit(conn, actor, "set_admin", None, {"open_id": open_id, "is_admin": is_admin}, request)
-    return RedirectResponse("/admin", status_code=303)
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 @app.post("/admin/users/{open_id}/role")
@@ -3784,7 +3786,7 @@ def admin_set_user_role(
             (managed_role, 1 if managed_role == "admin" else 0, open_id),
         )
         audit(conn, actor, "set_user_role", None, {"open_id": open_id, "managed_role": managed_role}, request)
-    return RedirectResponse("/admin", status_code=303)
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 @app.get("/admin/export/today")
@@ -4333,34 +4335,6 @@ def admin_page(
         batches = conn.execute("SELECT * FROM import_batches ORDER BY id DESC").fetchall()
         payments, sort, dir = admin_payment_rows(conn, sort, dir)
         admin_search_results, admin_search_message = admin_claim_search_rows(conn, admin_q, actor, request)
-        logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 30").fetchall()
-        profiles = conn.execute(
-            "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
-        ).fetchall()
-        scope_rows = conn.execute(
-            "SELECT * FROM user_scopes WHERE active = 1 ORDER BY open_id, id DESC"
-        ).fetchall()
-        app_user_rows = (
-            conn.execute(
-                """
-                SELECT open_id, name, managed_role, is_admin, last_login
-                FROM app_users
-                ORDER BY
-                    CASE
-                        WHEN managed_role = 'admin' OR is_admin = 1 THEN 0
-                        WHEN managed_role = 'general_manager' THEN 1
-                        ELSE 2
-                    END,
-                    last_login DESC
-                """
-            ).fetchall()
-            if actor["role"] == "superadmin"
-            else []
-        )
-
-    user_scopes_by_open_id: dict[str, list[sqlite3.Row]] = {}
-    for scope_row in scope_rows:
-        user_scopes_by_open_id.setdefault(scope_row["open_id"], []).append(scope_row)
 
     stat_map = {row["status"]: row for row in stats}
     stat_html = "".join(
@@ -4404,86 +4378,6 @@ def admin_page(
         if len(batches) > 10
         else ""
     )
-
-    log_rows = "".join(
-        f"<tr><td class='nowrap'>{esc(row['at'])}</td><td class='nowrap'>{esc(row['actor_name'])}</td><td class='nowrap'>{esc(row['action'])}</td><td>{esc(row['payment_id'])}</td><td><span class='code'>{esc(row['detail_json'])}</span></td></tr>"
-        for row in logs
-    )
-    profile_parts = []
-    for p in profiles:
-        user_scope_rows = user_scopes_by_open_id.get(p["open_id"], [])
-        scope_badges = "".join(
-            f"""
-            <div class="muted" style="margin-top:6px">
-              参与范围：{esc(scope_display_label(row["department"], row["team"] or "", row["label"] or ""))}
-              <form method="post" action="/admin/scopes/{row['id']}/deactivate" style="display:inline" onsubmit="return confirm('确定停用这个参与范围吗？')">
-                {finance_hidden(actor)}
-                <button class="secondary" type="submit" style="padding:3px 8px; margin-left:6px; font-size:12px">停用</button>
-              </form>
-            </div>
-            """
-            for row in user_scope_rows
-        )
-        profile_parts.append(
-            f"""
-        <tr>
-          <td><strong>{esc(p["name"] or "")}</strong><br><span class="code">{esc(p["open_id"])}</span></td>
-          <td class="actions">
-            <form method="post" action="/admin/profiles/{esc(p['open_id'])}" class="row" style="align-items:end">
-              {finance_hidden(actor)}
-              <div style="min-width:170px; flex:1"><label>部门</label>{department_select("department", p["department"] or "", required=True, class_name="cs-dept")}</div>
-              <div style="min-width:170px; flex:1"><label>中心 / 小组</label>{team_select("team", p["department"] or "", p["team"] or "", required=True)}</div>
-              <div><button class="secondary" type="submit">保存</button></div>
-            </form>
-            {scope_badges}
-            <form method="post" action="/admin/scopes/{esc(p['open_id'])}/add" class="row" style="align-items:end; margin-top:10px; border-top:1px dashed var(--line); padding-top:10px">
-              {finance_hidden(actor)}
-              <div style="min-width:170px; flex:1"><label>新增参与部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
-              <div style="min-width:170px; flex:1"><label>中心 / 小组（可选）</label>{team_select("team", "", required=False)}</div>
-              <div style="min-width:180px; flex:1"><label>显示名称（可选）</label><input name="label" placeholder="如：年会报名组"></div>
-              <div><button class="secondary" type="submit">添加参与范围</button></div>
-            </form>
-          </td>
-          <td class="nowrap muted">{esc(p["updated_at"])}</td>
-        </tr>
-        """
-        )
-    profile_rows = "".join(profile_parts)
-
-    # 管理员管理（仅超级管理员可见）
-    admin_section = ""
-    if actor["role"] == "superadmin":
-        admin_user_rows = "".join(
-            (
-                f"""
-            <tr>
-              <td><strong>{esc(u["name"] or "")}</strong><br><span class="code">{esc(u["open_id"])}</span></td>
-              <td>{role_badge("superadmin") if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS else role_badge(effective_app_user_role(u))}</td>
-              <td class="nowrap muted">{esc(u["last_login"] or "")}</td>
-              <td>{
-                  '<span class="muted">根权限，不可更改</span>'
-                  if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS
-                  else f'''<form method="post" action="/admin/users/{esc(u['open_id'])}/role" class="row" style="align-items:end">
-                    {finance_hidden(actor)}
-                    <div style="min-width:160px"><label>身份</label><select name="managed_role">{managed_role_options(effective_app_user_role(u))}</select></div>
-                    <button class="secondary" type="submit">保存身份</button>
-                  </form>'''
-              }</td>
-            </tr>
-            """
-            )
-            for u in app_user_rows
-        )
-        admin_section = f"""
-        <h2>身份管理</h2>
-        <p class="hint" style="margin:-4px 0 12px">只有你（超级管理员）能看到这里。事业部总经理只是身份标签，不会获得管理后台权限。</p>
-        <div class="table-wrap">
-        <table>
-          <thead><tr><th>成员</th><th>当前身份</th><th>最近登录</th><th>操作</th></tr></thead>
-          <tbody>{admin_user_rows or '<tr><td colspan="4" class="empty">还没有人登录过</td></tr>'}</tbody>
-        </table>
-        </div>
-        """
 
     body = f"""
     {admin_notice_html(notice, imported, skipped)}
@@ -4563,15 +4457,127 @@ def admin_page(
       </form>
     </div>
 
+    {admin_script()}
+    """
+    return page("财务后台", body, active="admin", subtitle="导入流水、管理项目、处理认领", actor=actor)
+
+
+@app.get("/admin/system", response_class=HTMLResponse)
+def admin_system_page(request: Request) -> HTMLResponse:
+    actor = actor_from_request(request)
+    require_superadmin(actor)
+    with get_conn() as conn:
+        logs = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 30").fetchall()
+        profiles = conn.execute(
+            "SELECT open_id, name, department, team, updated_at FROM user_profiles ORDER BY updated_at DESC"
+        ).fetchall()
+        scope_rows = conn.execute(
+            "SELECT * FROM user_scopes WHERE active = 1 ORDER BY open_id, id DESC"
+        ).fetchall()
+        app_user_rows = conn.execute(
+            """
+            SELECT open_id, name, managed_role, is_admin, last_login
+            FROM app_users
+            ORDER BY
+                CASE
+                    WHEN managed_role = 'admin' OR is_admin = 1 THEN 0
+                    WHEN managed_role = 'general_manager' THEN 1
+                    ELSE 2
+                END,
+                last_login DESC
+            """
+        ).fetchall()
+
+    user_scopes_by_open_id: dict[str, list[sqlite3.Row]] = {}
+    for scope_row in scope_rows:
+        user_scopes_by_open_id.setdefault(scope_row["open_id"], []).append(scope_row)
+
+    profile_parts = []
+    for p in profiles:
+        user_scope_rows = user_scopes_by_open_id.get(p["open_id"], [])
+        scope_badges = "".join(
+            f"""
+            <div class="muted" style="margin-top:6px">
+              参与范围：{esc(scope_display_label(row["department"], row["team"] or "", row["label"] or ""))}
+              <form method="post" action="/admin/scopes/{row['id']}/deactivate" style="display:inline" onsubmit="return confirm('确定停用这个参与范围吗？')">
+                {finance_hidden(actor)}
+                <button class="secondary" type="submit" style="padding:3px 8px; margin-left:6px; font-size:12px">停用</button>
+              </form>
+            </div>
+            """
+            for row in user_scope_rows
+        )
+        profile_parts.append(
+            f"""
+        <tr>
+          <td><strong>{esc(p["name"] or "")}</strong><br><span class="code">{esc(p["open_id"])}</span></td>
+          <td class="actions">
+            <form method="post" action="/admin/profiles/{esc(p['open_id'])}" class="row" style="align-items:end">
+              {finance_hidden(actor)}
+              <div style="min-width:170px; flex:1"><label>部门</label>{department_select("department", p["department"] or "", required=True, class_name="cs-dept")}</div>
+              <div style="min-width:170px; flex:1"><label>中心 / 小组</label>{team_select("team", p["department"] or "", p["team"] or "", required=True)}</div>
+              <div><button class="secondary" type="submit">保存</button></div>
+            </form>
+            {scope_badges}
+            <form method="post" action="/admin/scopes/{esc(p['open_id'])}/add" class="row" style="align-items:end; margin-top:10px; border-top:1px dashed var(--line); padding-top:10px">
+              {finance_hidden(actor)}
+              <div style="min-width:170px; flex:1"><label>新增参与部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
+              <div style="min-width:170px; flex:1"><label>中心 / 小组（可选）</label>{team_select("team", "", required=False)}</div>
+              <div style="min-width:180px; flex:1"><label>显示名称（可选）</label><input name="label" placeholder="如：年会报名组"></div>
+              <div><button class="secondary" type="submit">添加参与范围</button></div>
+            </form>
+          </td>
+          <td class="nowrap muted">{esc(p["updated_at"])}</td>
+        </tr>
+        """
+        )
+    profile_rows = "".join(profile_parts)
+
+    admin_user_rows = "".join(
+        (
+            f"""
+        <tr>
+          <td><strong>{esc(u["name"] or "")}</strong><br><span class="code">{esc(u["open_id"])}</span></td>
+          <td>{role_badge("superadmin") if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS else role_badge(effective_app_user_role(u))}</td>
+          <td class="nowrap muted">{esc(u["last_login"] or "")}</td>
+          <td>{
+              '<span class="muted">根权限，不可更改</span>'
+              if u["open_id"] in FEISHU_SUPERADMIN_OPEN_IDS
+              else f'''<form method="post" action="/admin/users/{esc(u['open_id'])}/role" class="row" style="align-items:end">
+                {finance_hidden(actor)}
+                <div style="min-width:160px"><label>身份</label><select name="managed_role">{managed_role_options(effective_app_user_role(u))}</select></div>
+                <button class="secondary" type="submit">保存身份</button>
+              </form>'''
+          }</td>
+        </tr>
+        """
+        )
+        for u in app_user_rows
+    )
+    log_rows = "".join(
+        f"<tr><td class='nowrap'>{esc(row['at'])}</td><td class='nowrap'>{esc(row['actor_name'])}</td><td class='nowrap'>{esc(row['action'])}</td><td>{esc(row['payment_id'])}</td><td><span class='code'>{esc(row['detail_json'])}</span></td></tr>"
+        for row in logs
+    )
+
+    body = f"""
     <h2>成员部门</h2>
-    <p class="hint" style="margin:-4px 0 12px">登录过并设置过部门的成员都在这里。有人选错了，管理员可直接改。</p>
+    <p class="hint" style="margin:-4px 0 12px">登录过并设置过部门的成员都在这里。有人选错了，超级管理员可直接改。</p>
     <div class="table-wrap">
     <table>
       <thead><tr><th>成员</th><th style="width:520px">部门 / 中心</th><th>更新时间</th></tr></thead>
       <tbody>{profile_rows or '<tr><td colspan="3" class="empty">还没有成员设置过部门</td></tr>'}</tbody>
     </table>
     </div>
-    {admin_section}
+
+    <h2>身份管理</h2>
+    <p class="hint" style="margin:-4px 0 12px">只有超级管理员能看到这里。事业部总经理只是身份标签，不会获得财务后台权限。</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>成员</th><th>当前身份</th><th>最近登录</th><th>操作</th></tr></thead>
+      <tbody>{admin_user_rows or '<tr><td colspan="4" class="empty">还没有人登录过</td></tr>'}</tbody>
+    </table>
+    </div>
+
     <h2>最近操作日志</h2>
     <div class="table-wrap">
     <table>
@@ -4581,7 +4587,7 @@ def admin_page(
     </div>
     {admin_script()}
     """
-    return page("管理后台", body, active="admin", subtitle="导入流水、管理项目、处理认领与操作日志", actor=actor)
+    return page("管理后台", body, active="system", subtitle="管理成员部门、身份与操作日志", actor=actor)
 
 
 @app.post("/admin/catalog/projects")
