@@ -84,6 +84,10 @@ class ExcelImportTests(unittest.TestCase):
         install_fastapi_stub()
         cls.app = importlib.import_module("app")
 
+    def test_parse_date_supports_compact_yyyymmdd(self) -> None:
+        self.assertEqual(self.app.parse_date("20260707"), "2026-07-07")
+        self.assertEqual(self.app.parse_date("2026-07-07"), "2026-07-07")
+
     def test_ooxml_workbook_with_xls_suffix_imports(self) -> None:
         workbook = Workbook()
         sheet = workbook.active
@@ -1852,7 +1856,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn((department, 32000), user_all_dashboard["departments"])
         self.assertIn((other_department, 18000), user_all_dashboard["departments"])
 
-    def test_today_claim_plain_text_groups_payer_and_skips_unclaimed(self) -> None:
+    def test_today_claim_plain_text_groups_payer_and_appends_unclaimed_summary(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -1861,6 +1865,7 @@ class ExcelImportTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY,
                 received_date TEXT,
                 payer_name TEXT,
+                amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL
             );
             CREATE TABLE claims (
@@ -1874,14 +1879,14 @@ class ExcelImportTests(unittest.TestCase):
             """
         )
         conn.executemany(
-            "INSERT INTO payments (id, received_date, payer_name, status) VALUES (?, ?, ?, ?)",
+            "INSERT INTO payments (id, received_date, payer_name, amount_cents, status) VALUES (?, ?, ?, ?, ?)",
             [
-                (1, "2026-07-01", "银联POS款", "pending_confirm"),
-                (2, "2026-07-01", "银联POS款", "pending_confirm"),
-                (3, "2026-07-01", "南京工业大学实验小学", "pending_confirm"),
-                (4, "2026-07-01", "未认领客户", "pending"),
-                (5, "2026-07-01", "已取消客户", "pending"),
-                (6, "2026-07-02", "明日客户", "pending_confirm"),
+                (1, "2026-07-01", "银联POS款", 55740, "claimed"),
+                (2, "2026-07-01", "银联POS款", 59130, "claimed"),
+                (3, "2026-07-01", "南京工业大学实验小学", 64200, "claimed"),
+                (4, "2026-07-01", "未认领客户", 20000, "pending"),
+                (5, "2026-07-01", "已取消客户", 99900, "closed"),
+                (6, "2026-07-02", "明日客户", 10000, "claimed"),
             ],
         )
         conn.executemany(
@@ -1910,7 +1915,8 @@ class ExcelImportTests(unittest.TestCase):
                     "",
                     "1.银联POS款\t1,148.70元（学生发展事业部  咖啡收入405.40元，产品与文创152.00元，阅读创新591.30元）",
                     "2.南京工业大学实验小学\t642.00元（教育智能研究院  云智库地图606.00元，家长认知与行为地图36.00元）",
-                    "今日合计：1,790.70元",
+                    "3.未认领\t200.00元",
+                    "今日合计：1,990.70元",
                 ]
             ),
         )
@@ -1941,9 +1947,18 @@ class ExcelImportTests(unittest.TestCase):
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
-                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "目标客户", 10000, "目标备注", "蒲公英智库", "pending"),
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "目标客户", 10000, "目标备注", "蒲公英智库", "claimed"),
                             (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "其他客户", 20000, "其他备注", "蒲公英智库", "pending"),
                         ],
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (1, "培训事业部", "会议中心", 10000, "claim-user", "张三", "目标项目", "", "", "accepted", "2026-07-01 10:05:00"),
                     )
                     conn.commit()
                 self.app.actor_from_request = lambda request: {
@@ -1969,6 +1984,170 @@ class ExcelImportTests(unittest.TestCase):
                 self.assertIn("目标备注", body)
                 self.assertNotIn("其他客户", body)
                 self.assertEqual(response.headers["content-disposition"], 'attachment; filename="claim_pool_2026-07-01.csv"')
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_csv_export_appends_unclaimed_summary_after_claim_rows(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-unclaimed-summary.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-01 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "已认领客户", 10000, "已认领备注", "蒲公英智库", "claimed"),
+                            (2, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "未认领客户", 25000, "未认领备注", "蒲公英智库", "pending"),
+                            (3, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "部分认领客户", 50000, "部分认领备注", "蒲公英智库", "partial_claiming"),
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (1, "培训事业部", "会议中心", 10000, "claim-user", "张三", "已认领项目", "", "", "accepted", "2026-07-01 10:05:00"),
+                            (3, "培训事业部", "会议中心", 30000, "claim-user", "张三", "部分认领项目", "", "", "accepted", "2026-07-01 10:06:00"),
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.88"),
+                    cookies={},
+                    query_params={"date": "2026-07-01"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.export_today_payments(request)
+                body = response.body.decode("utf-8-sig")
+                data_lines = body.splitlines()[1:]
+
+                self.assertIn("已认领客户", body)
+                self.assertIn("部分认领客户", body)
+                self.assertNotIn("未认领客户", body)
+                self.assertNotIn("未认领备注", body)
+                self.assertIn("未认领", data_lines[-1])
+                self.assertIn("450.00", data_lines[-1])
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_admin_exports_include_compact_yyyymmdd_dates_after_repair(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "export-compact-date.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO import_batches (id, source_name, created_at, created_by, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (1, "测试批次", "2026-07-07 10:00:00", "finance", "confirmed"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO payments
+                            (id, batch_id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            60,
+                            1,
+                            "2026-07-07 10:00:00",
+                            "2026-07-07 10:01:00",
+                            "20260707",
+                            "",
+                            "银联POS款",
+                            356000,
+                            "深圳市南山实验教育集团园丁学校班主任培训",
+                            "重庆市蒲公英未来科技有限公司",
+                            "claimed",
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            60,
+                            "培训事业部",
+                            "会议中心",
+                            356000,
+                            "claim-user",
+                            "赵军红",
+                            "2026年班主任峰会",
+                            "",
+                            "",
+                            "accepted",
+                            "2026-07-07 10:05:00",
+                        ),
+                    )
+                    conn.commit()
+
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    received_date = conn.execute("SELECT received_date FROM payments WHERE id = 60").fetchone()[0]
+                self.assertEqual(received_date, "2026-07-07")
+
+                self.app.actor_from_request = lambda request: {
+                    "id": "finance",
+                    "name": "财务",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.87"),
+                    cookies={},
+                    query_params={"date": "2026-07-07"},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                csv_response = self.app.export_today_payments(request)
+                csv_body = csv_response.body.decode("utf-8-sig")
+                text_response = self.app.export_today_claim_plain_text(request)
+                text_body = text_response.body.decode("utf-8")
+
+                self.assertIn("银联POS款", csv_body)
+                self.assertIn("2026-07-07", csv_body)
+                self.assertIn("银联POS款", text_body)
+                self.assertIn("2026年班主任峰会3,560.00元", text_body)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
@@ -2135,9 +2314,21 @@ class ExcelImportTests(unittest.TestCase):
                         """,
                         [
                             (1, 1, "2026-07-01 10:00:00", "2026-07-01 10:01:00", "2026-07-01", "10:00:00", "区间外客户", 10000, "区间外备注", "蒲公英智库", "pending"),
-                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "区间客户A", 20000, "区间备注A", "蒲公英智库", "pending"),
-                            (3, 1, "2026-07-04 10:00:00", "2026-07-04 10:01:00", "2026-07-04", "10:00:00", "区间客户B", 30000, "区间备注B", "蒲公英智库", "pending"),
+                            (2, 1, "2026-07-02 10:00:00", "2026-07-02 10:01:00", "2026-07-02", "10:00:00", "区间客户A", 20000, "区间备注A", "蒲公英智库", "claimed"),
+                            (3, 1, "2026-07-04 10:00:00", "2026-07-04 10:01:00", "2026-07-04", "10:00:00", "区间客户B", 30000, "区间备注B", "蒲公英智库", "claimed"),
                             (4, 1, "2026-07-05 10:00:00", "2026-07-05 10:01:00", "2026-07-05", "10:00:00", "区间后客户", 40000, "区间后备注", "蒲公英智库", "pending"),
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (payment_id, department, team, amount_cents, actor_id, actor_name,
+                             customer_project, contract_invoice, note, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (2, "培训事业部", "会议中心", 20000, "claim-user", "张三", "区间项目A", "", "", "accepted", "2026-07-02 10:05:00"),
+                            (3, "培训事业部", "会议中心", 30000, "claim-user", "张三", "区间项目B", "", "", "accepted", "2026-07-04 10:05:00"),
                         ],
                     )
                     conn.commit()

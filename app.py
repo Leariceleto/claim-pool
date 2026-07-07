@@ -374,6 +374,7 @@ def init_db() -> None:
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "app_users", "managed_role", "managed_role TEXT NOT NULL DEFAULT 'claimant'")
+        repair_compact_payment_dates(conn)
         conn.execute(
             "UPDATE payments SET closed_at = ? WHERE status = 'closed' AND COALESCE(closed_at, '') = ''",
             (now_text(),),
@@ -387,6 +388,23 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def repair_compact_payment_dates(conn: sqlite3.Connection) -> int:
+    repaired = 0
+    rows = conn.execute(
+        "SELECT id, received_date FROM payments WHERE LENGTH(COALESCE(received_date, '')) = 8"
+    ).fetchall()
+    for row in rows:
+        raw_date = str(row["received_date"] or "").strip()
+        if not re.fullmatch(r"\d{8}", raw_date):
+            continue
+        normalized = parse_date(raw_date)
+        if normalized == raw_date:
+            continue
+        conn.execute("UPDATE payments SET received_date = ? WHERE id = ?", (normalized, row["id"]))
+        repaired += 1
+    return repaired
 
 
 @app.on_event("startup")
@@ -494,6 +512,10 @@ def parse_date(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
+    compact_match = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", text)
+    if compact_match:
+        y, m, d = compact_match.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
     text = text.replace("/", "-").replace(".", "-")
     match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
     if match:
@@ -3829,6 +3851,8 @@ def export_today_payments(request: Request) -> Response:
                 (row["id"],),
             ).fetchall()
         if not claim_rows:
+            if row["status"] in {"pending", "partial_claiming"}:
+                continue
             claim_rows = [None]
         for claim in claim_rows:
             writer.writerow(
@@ -3858,6 +3882,36 @@ def export_today_payments(request: Request) -> Response:
                     row["confirmed_at"],
                 ]
             )
+    with get_conn() as conn:
+        unclaimed_cents = unclaimed_amount_cents(conn, start_date, end_date)
+    if unclaimed_cents > 0:
+        writer.writerow(
+            [
+                "",
+                "",
+                start_date if start_date == end_date else f"{start_date} 至 {end_date}",
+                "",
+                "未认领",
+                "",
+                money(unclaimed_cents),
+                money(unclaimed_cents),
+                "",
+                "",
+                "",
+                "pending",
+                "未认领",
+                "",
+                "",
+                "未认领",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
     filename = f"claim_pool_{start_date}.csv" if start_date == end_date else f"claim_pool_{start_date}_to_{end_date}.csv"
     return Response(
         "\ufeff" + output.getvalue(),
@@ -3913,6 +3967,30 @@ def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> st
     return build_claim_plain_text(conn, date_text, date_text)
 
 
+def unclaimed_amount_cents(conn: sqlite3.Connection, start_date: str, end_date: str) -> int:
+    rows = conn.execute(
+        """
+        SELECT
+            p.id AS payment_id,
+            p.amount_cents AS payment_amount_cents,
+            COALESCE(SUM(CASE WHEN c.status IN ('pending', 'accepted') THEN c.amount_cents ELSE 0 END), 0)
+                AS claimed_amount_cents
+        FROM payments p
+        LEFT JOIN claims c ON c.payment_id = p.id
+        WHERE p.received_date BETWEEN ? AND ?
+          AND p.status IN ('pending', 'partial_claiming')
+        GROUP BY p.id
+        """,
+        (start_date, end_date),
+    ).fetchall()
+    total = 0
+    for row in rows:
+        remaining = int(row["payment_amount_cents"] or 0) - int(row["claimed_amount_cents"] or 0)
+        if remaining > 0:
+            total += remaining
+    return total
+
+
 def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: str) -> str:
     rows = conn.execute(
         """
@@ -3949,6 +4027,7 @@ def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: 
 
     lines = [plain_text_range_label(start_date, end_date), ""]
     grand_total = 0
+    index = 0
     for index, (payer, item) in enumerate(payer_items.items(), start=1):
         grand_total += item["total"]
         department_parts = []
@@ -3956,6 +4035,10 @@ def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: 
             project_parts = [f"{project}{money(amount)}元" for project, amount in projects.items()]
             department_parts.append(f"{department}  {'，'.join(project_parts)}")
         lines.append(f"{index}.{payer}\t{money(item['total'])}元（{'；'.join(department_parts)}）")
+    unclaimed_cents = unclaimed_amount_cents(conn, start_date, end_date)
+    if unclaimed_cents > 0:
+        lines.append(f"{index + 1}.未认领\t{money(unclaimed_cents)}元")
+        grand_total += unclaimed_cents
     total_label = "今日合计" if start_date == end_date else "区间合计"
     lines.append(f"{total_label}：{money(grand_total)}元")
     return "\n".join(lines)
