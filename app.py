@@ -3846,12 +3846,17 @@ def export_today_payments(request: Request) -> Response:
             "确认入池时间",
         ]
     )
+    unclaimed_rows: list[tuple[sqlite3.Row, int]] = []
     for row in rows:
         with get_conn() as conn:
             claim_rows = conn.execute(
                 "SELECT * FROM claims WHERE payment_id = ? AND status IN ('pending', 'accepted') ORDER BY id",
                 (row["id"],),
             ).fetchall()
+        active_amount_cents = sum(int(claim["amount_cents"] or 0) for claim in claim_rows)
+        remaining_cents = max(int(row["amount_cents"] or 0) - active_amount_cents, 0)
+        if row["status"] in {"pending", "partial_claiming"} and remaining_cents > 0:
+            unclaimed_rows.append((row, remaining_cents))
         if not claim_rows:
             if row["status"] in {"pending", "partial_claiming"}:
                 continue
@@ -3884,26 +3889,21 @@ def export_today_payments(request: Request) -> Response:
                     row["confirmed_at"],
                 ]
             )
-    with get_conn() as conn:
-        unclaimed_cents = unclaimed_amount_cents(conn, start_date, end_date)
-    if unclaimed_cents > 0:
+    for row, remaining_cents in unclaimed_rows:
         writer.writerow(
             [
+                row["id"],
                 "",
-                "",
-                start_date if start_date == end_date else f"{start_date} 至 {end_date}",
-                "",
-                "未认领",
-                "",
-                money(unclaimed_cents),
-                money(unclaimed_cents),
-                "",
-                "",
-                "",
-                "pending",
-                "未认领",
-                "",
-                "",
+                row["received_date"],
+                row["received_time"],
+                row["payer_name"],
+                row["receiver_company"],
+                money(row["amount_cents"]),
+                money(remaining_cents),
+                row["bank_note"],
+                row["receiver_account"],
+                row["serial_no"],
+                row["status"],
                 "未认领",
                 "",
                 "",
@@ -3911,7 +3911,10 @@ def export_today_payments(request: Request) -> Response:
                 "",
                 "",
                 "",
-                "",
+                row["finance_note"],
+                row["source_ref"],
+                row["imported_at"],
+                row["confirmed_at"],
             ]
         )
     filename = f"claim_pool_{start_date}.csv" if start_date == end_date else f"claim_pool_{start_date}_to_{end_date}.csv"
@@ -3969,11 +3972,12 @@ def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> st
     return build_claim_plain_text(conn, date_text, date_text)
 
 
-def unclaimed_amount_cents(conn: sqlite3.Connection, start_date: str, end_date: str) -> int:
+def unclaimed_payer_amounts(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[tuple[str, int]]:
     rows = conn.execute(
         """
         SELECT
             p.id AS payment_id,
+            p.payer_name AS payer_name,
             p.amount_cents AS payment_amount_cents,
             COALESCE(SUM(CASE WHEN c.status IN ('pending', 'accepted') THEN c.amount_cents ELSE 0 END), 0)
                 AS claimed_amount_cents
@@ -3985,12 +3989,13 @@ def unclaimed_amount_cents(conn: sqlite3.Connection, start_date: str, end_date: 
         """,
         (start_date, end_date),
     ).fetchall()
-    total = 0
+    payer_items: dict[str, int] = {}
     for row in rows:
+        payer = (row["payer_name"] or "").strip() or "未填写付款方"
         remaining = int(row["payment_amount_cents"] or 0) - int(row["claimed_amount_cents"] or 0)
         if remaining > 0:
-            total += remaining
-    return total
+            payer_items[payer] = payer_items.get(payer, 0) + remaining
+    return [(payer, amount_cents) for payer, amount_cents in payer_items.items()]
 
 
 def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: str) -> str:
@@ -4037,10 +4042,10 @@ def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: 
             project_parts = [f"{project}{money(amount)}元" for project, amount in projects.items()]
             department_parts.append(f"{department}  {'，'.join(project_parts)}")
         lines.append(f"{index}.{payer}\t{money(item['total'])}元（{'；'.join(department_parts)}）")
-    unclaimed_cents = unclaimed_amount_cents(conn, start_date, end_date)
-    if unclaimed_cents > 0:
-        lines.append(f"{index + 1}.未认领\t{money(unclaimed_cents)}元")
-        grand_total += unclaimed_cents
+    for payer, amount_cents in unclaimed_payer_amounts(conn, start_date, end_date):
+        index += 1
+        lines.append(f"{index}.{payer}\t{money(amount_cents)}元（未认领）")
+        grand_total += amount_cents
     total_label = "今日合计" if start_date == end_date else "区间合计"
     lines.append(f"{total_label}：{money(grand_total)}元")
     return "\n".join(lines)

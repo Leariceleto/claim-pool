@@ -1,4 +1,6 @@
+import csv
 import importlib
+import io
 import json
 import sqlite3
 import sys
@@ -1971,7 +1973,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn((department, 32000), user_all_dashboard["departments"])
         self.assertIn((other_department, 18000), user_all_dashboard["departments"])
 
-    def test_today_claim_plain_text_groups_payer_and_appends_unclaimed_summary(self) -> None:
+    def test_today_claim_plain_text_groups_payer_and_appends_unclaimed_payers(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -2030,12 +2032,11 @@ class ExcelImportTests(unittest.TestCase):
                     "",
                     "1.银联POS款\t1,148.70元（学生发展事业部  咖啡收入405.40元，产品与文创152.00元，阅读创新591.30元）",
                     "2.南京工业大学实验小学\t642.00元（教育智能研究院  云智库地图606.00元，家长认知与行为地图36.00元）",
-                    "3.未认领\t200.00元",
+                    "3.未认领客户\t200.00元（未认领）",
                     "今日合计：1,990.70元",
                 ]
             ),
         )
-        self.assertNotIn("未认领客户", text)
         self.assertNotIn("已取消客户", text)
         self.assertNotIn("明日客户", text)
 
@@ -2103,7 +2104,7 @@ class ExcelImportTests(unittest.TestCase):
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
 
-    def test_admin_csv_export_appends_unclaimed_summary_after_claim_rows(self) -> None:
+    def test_admin_csv_export_appends_unclaimed_payment_rows_after_claim_rows(self) -> None:
         old_db_path = self.app.DB_PATH
         old_actor_from_request = self.app.actor_from_request
         try:
@@ -2162,14 +2163,24 @@ class ExcelImportTests(unittest.TestCase):
 
                 response = self.app.export_today_payments(request)
                 body = response.body.decode("utf-8-sig")
-                data_lines = body.splitlines()[1:]
+                rows = list(csv.DictReader(io.StringIO(body)))
 
                 self.assertIn("已认领客户", body)
                 self.assertIn("部分认领客户", body)
-                self.assertNotIn("未认领客户", body)
-                self.assertNotIn("未认领备注", body)
-                self.assertIn("未认领", data_lines[-1])
-                self.assertIn("450.00", data_lines[-1])
+                self.assertIn("未认领客户", body)
+                self.assertIn("未认领备注", body)
+                unclaimed_rows = [row for row in rows if row["认领状态"] == "未认领"]
+                self.assertEqual(len(unclaimed_rows), 2)
+                self.assertEqual(unclaimed_rows[0]["付款方"], "部分认领客户")
+                self.assertEqual(unclaimed_rows[0]["到款金额"], "500.00")
+                self.assertEqual(unclaimed_rows[0]["认领金额"], "200.00")
+                self.assertEqual(unclaimed_rows[0]["银行备注"], "部分认领备注")
+                self.assertEqual(unclaimed_rows[0]["认领部门"], "")
+                self.assertEqual(unclaimed_rows[0]["项目"], "")
+                self.assertEqual(unclaimed_rows[1]["付款方"], "未认领客户")
+                self.assertEqual(unclaimed_rows[1]["到款金额"], "250.00")
+                self.assertEqual(unclaimed_rows[1]["认领金额"], "250.00")
+                self.assertEqual(unclaimed_rows[1]["认领人"], "")
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
