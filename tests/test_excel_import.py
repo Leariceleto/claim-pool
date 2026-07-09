@@ -414,6 +414,8 @@ class ExcelImportTests(unittest.TestCase):
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 claimed_department TEXT,
@@ -479,6 +481,8 @@ class ExcelImportTests(unittest.TestCase):
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 claimed_department TEXT,
@@ -495,7 +499,18 @@ class ExcelImportTests(unittest.TestCase):
                 payment_id INTEGER NOT NULL,
                 amount_cents INTEGER NOT NULL,
                 actor_id TEXT NOT NULL,
+                department TEXT,
+                team TEXT,
+                customer_project TEXT,
                 status TEXT NOT NULL
+            );
+            CREATE TABLE app_users (
+                open_id TEXT PRIMARY KEY,
+                name TEXT,
+                managed_role TEXT NOT NULL DEFAULT 'claimant',
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_login TEXT
             );
             CREATE TABLE audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -513,12 +528,14 @@ class ExcelImportTests(unittest.TestCase):
         conn.execute(
             """
             INSERT INTO payments
-                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                (id, received_date, payer_name, amount_cents, status, claimed_department, claimed_team, claimed_by,
                  claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 1,
+                "2026-07-01",
+                "测试客户",
                 776000,
                 "claimed",
                 "中国教育创新年会事业部",
@@ -532,23 +549,52 @@ class ExcelImportTests(unittest.TestCase):
             ),
         )
         conn.execute(
-            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, status) VALUES (?, ?, ?, ?, ?)",
-            (1, 1, 776000, "user-a", "accepted"),
+            "INSERT INTO claims (id, payment_id, amount_cents, actor_id, department, team, customer_project, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 1, 776000, "user-a", "中国教育创新年会事业部", "创新年会", "报名费", "accepted"),
+        )
+        conn.executemany(
+            """
+            INSERT INTO app_users (open_id, name, managed_role, is_admin, created_at, last_login)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("admin-1", "管理员", "admin", 1, "2026-07-01 09:00:00", "2026-07-01 12:00:00"),
+                ("super-1", "超级管理员", "claimant", 0, "2026-07-01 09:00:00", "2026-07-01 12:00:00"),
+            ],
         )
         actor = {"id": "user-a", "name": "测试用户", "role": "claimant"}
 
-        detail = self.app.cancel_my_claim(conn, actor, 1)
+        sent: list[tuple[str, str]] = []
+        old_superadmins = self.app.FEISHU_SUPERADMIN_OPEN_IDS
+        old_send = self.app.feishu_send_text
+        self.app.FEISHU_SUPERADMIN_OPEN_IDS = {"super-1"}
+        self.app.feishu_send_text = lambda open_id, text: sent.append((open_id, text)) or True
+        try:
+            detail = self.app.cancel_my_claim(conn, actor, 1)
+        finally:
+            self.app.FEISHU_SUPERADMIN_OPEN_IDS = old_superadmins
+            self.app.feishu_send_text = old_send
 
         payment = conn.execute("SELECT status, claimed_by, claimed_department FROM payments WHERE id = 1").fetchone()
         claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
         audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
+        audit_detail = json.loads(audit_row["detail_json"])
 
         self.assertEqual(detail["payment_status"], "pending")
+        self.assertTrue(detail["admin_notified"])
+        self.assertEqual(detail["admin_notify_count"], 1)
         self.assertEqual(claim["status"], "canceled")
         self.assertEqual(payment["status"], "pending")
         self.assertIsNone(payment["claimed_by"])
         self.assertIsNone(payment["claimed_department"])
+        self.assertEqual(sent[0][0], "admin-1")
+        self.assertIn("【认领已取消】", sent[0][1])
+        self.assertIn("测试用户取消了一笔到款认领", sent[0][1])
+        self.assertIn("付款方：测试客户", sent[0][1])
+        self.assertIn("取消认领金额：¥ 7,760.00", sent[0][1])
         self.assertEqual(audit_row["action"], "cancel_my_claim")
+        self.assertTrue(audit_detail["admin_notified"])
+        self.assertEqual(audit_detail["admin_notify_count"], 1)
 
     def test_cancel_my_claim_rejects_other_users_claim(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -1846,6 +1892,89 @@ class ExcelImportTests(unittest.TestCase):
                 self.assertEqual(pool_section.count('style="display:none"'), 5)
                 self.assertIn('data-progressive-step="20"', pool_section)
                 self.assertIn("显示更多", pool_section)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+
+    def test_personal_claims_use_payment_pool_progressive_display(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "personal-claims.db"
+                self.app.init_db()
+                with self.app.get_conn() as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO payments
+                            (id, imported_at, confirmed_at, received_date, received_time,
+                             payer_name, amount_cents, bank_note, receiver_company, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                i,
+                                "2026-07-07 10:00:00",
+                                "2026-07-07 10:01:00",
+                                "2026-07-07",
+                                "10:00:00",
+                                f"我的客户{i}",
+                                10000 + i,
+                                "测试备注",
+                                "重庆市蒲公英未来科技有限公司",
+                                "claimed",
+                            )
+                            for i in range(1, 106)
+                        ],
+                    )
+                    conn.executemany(
+                        """
+                        INSERT INTO claims
+                            (id, payment_id, department, team, actor_id, actor_name,
+                             customer_project, amount_cents, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                i,
+                                i,
+                                "培训事业部",
+                                "会议中心",
+                                "user-a",
+                                "测试用户",
+                                f"项目{i}",
+                                10000 + i,
+                                "accepted",
+                                "2026-07-07 10:30:00",
+                            )
+                            for i in range(1, 106)
+                        ],
+                    )
+                    conn.commit()
+                self.app.actor_from_request = lambda request: {
+                    "id": "user-a",
+                    "name": "测试用户",
+                    "role": "claimant",
+                    "department": "培训事业部",
+                    "team": "会议中心",
+                    "authed": "1",
+                }
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=None,
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                response = self.app.personal_center(request)
+                html = response.body.decode("utf-8")
+                claims_section = html[html.index("我的认领"):html.index("问题排查日志")]
+
+                self.assertEqual(claims_section.count('<tr data-progressive-group="my-claims"'), 105)
+                self.assertEqual(claims_section.count('style="display:none"'), 85)
+                self.assertIn('data-progressive-step="20"', claims_section)
+                self.assertIn("显示更多", claims_section)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path

@@ -428,6 +428,20 @@ def receiver_company_label(value: Any) -> str:
     return str(value or "").strip() or "未填写"
 
 
+def row_value(row: Any, key: str, default: Any = "") -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        if key in row.keys():
+            value = row[key]
+            return default if value is None else value
+    except (AttributeError, KeyError, IndexError):
+        pass
+    return default
+
+
 def build_batch_confirm_message(count: int, total_cents: int) -> str:
     return "\n".join(
         [
@@ -466,6 +480,80 @@ def build_payment_reject_message(payment: Union[sqlite3.Row, dict[str, Any]], re
             f"驳回原因：{reason.strip() or '未填写'}",
         ]
     )
+
+
+def build_claim_cancel_admin_message(
+    payment: Union[sqlite3.Row, dict[str, Any]],
+    claim: Union[sqlite3.Row, dict[str, Any]],
+    actor: dict[str, str],
+    payment_status: str,
+) -> str:
+    status_labels = {
+        "pending": "待认领",
+        "partial_claiming": "部分认领中",
+        "claimed": "已认领",
+        "pending_confirm": "已认领",
+        "rejected": "已驳回",
+        "closed": "已关闭",
+    }
+    department = row_value(claim, "department") or row_value(payment, "claimed_department")
+    team = row_value(claim, "team") or row_value(payment, "claimed_team")
+    project = row_value(claim, "customer_project") or row_value(payment, "customer_project")
+    owner = " / ".join(part for part in [department, team] if part)
+    if project:
+        owner = f"{owner} · {project}" if owner else project
+    return "\n".join(
+        [
+            "【认领已取消】",
+            f"{actor.get('name') or '有同事'}取消了一笔到款认领。",
+            f"付款方：{row_value(payment, 'payer_name') or '未填写付款方'}",
+            f"到款日期：{row_value(payment, 'received_date') or '未填写日期'}",
+            f"到款金额：¥ {money(row_value(payment, 'amount_cents', 0))}",
+            f"取消认领金额：¥ {money(row_value(claim, 'amount_cents', 0))}",
+            f"原认领归属：{owner or '未填写'}",
+            f"当前状态：{status_labels.get(payment_status, payment_status or '未知')}",
+        ]
+    )
+
+
+def admin_notification_open_ids(conn: sqlite3.Connection) -> list[str]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT open_id
+            FROM app_users
+            WHERE managed_role = 'admin' OR is_admin = 1
+            ORDER BY last_login DESC
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    open_ids: list[str] = []
+    for row in rows:
+        open_id = str(row["open_id"] or "").strip()
+        if open_id and open_id not in FEISHU_SUPERADMIN_OPEN_IDS and open_id not in open_ids:
+            open_ids.append(open_id)
+    return open_ids
+
+
+def notify_admins_claim_canceled(
+    conn: sqlite3.Connection,
+    payment: Union[sqlite3.Row, dict[str, Any]],
+    claim: Union[sqlite3.Row, dict[str, Any]],
+    actor: dict[str, str],
+    payment_status: str,
+) -> dict[str, Any]:
+    admin_open_ids = admin_notification_open_ids(conn)
+    message = build_claim_cancel_admin_message(payment, claim, actor, payment_status)
+    sent_count = 0
+    for open_id in admin_open_ids:
+        if feishu_send_text(open_id, message):
+            sent_count += 1
+    return {
+        "admin_notify_count": len(admin_open_ids),
+        "admin_notified_count": sent_count,
+        "admin_notified": sent_count > 0,
+    }
 
 
 def claim_note_summary(row: sqlite3.Row, claim_rows: list[sqlite3.Row]) -> str:
@@ -1943,36 +2031,6 @@ document.addEventListener('change', function (e) {
     updateBulkCloseState();
   }
 });
-function applyProgressiveTable(button) {
-  var group = button.dataset.progressiveGroup;
-  var rows = Array.prototype.slice.call(document.querySelectorAll('[data-progressive-group="' + group + '"]'));
-  var visibleCount = parseInt(button.dataset.visibleCount || '0', 10);
-  rows.forEach(function (row, index) {
-    row.style.display = index < visibleCount ? '' : 'none';
-  });
-  var remaining = Math.max(rows.length - visibleCount, 0);
-  button.style.display = remaining > 0 ? '' : 'none';
-  button.textContent = remaining > 0 ? '显示更多（剩余 ' + remaining + ' 条）' : '已全部显示';
-}
-function initProgressiveTables() {
-  document.querySelectorAll('[data-progressive-more]').forEach(function (button) {
-    if (!button.dataset.visibleCount) {
-      button.dataset.visibleCount = button.dataset.initialCount || button.dataset.progressiveStep || '10';
-    }
-    applyProgressiveTable(button);
-  });
-  updateBulkCloseState();
-}
-document.addEventListener('DOMContentLoaded', initProgressiveTables);
-document.addEventListener('click', function (e) {
-  var button = e.target.closest('[data-progressive-more]');
-  if (!button) return;
-  var step = parseInt(button.dataset.progressiveStep || '10', 10);
-  var visibleCount = parseInt(button.dataset.visibleCount || button.dataset.initialCount || step, 10);
-  button.dataset.visibleCount = visibleCount + step;
-  applyProgressiveTable(button);
-  updateBulkCloseState();
-});
 document.addEventListener('click', function (e) {
   var link = e.target.closest('.sort-link');
   if (!link || !link.dataset.tableUrl) return;
@@ -2002,6 +2060,39 @@ function confirmBulkClose() {
   if (count === 0) return false;
   return confirm('确定关闭选中的 ' + count + ' 条流水吗？关闭后 7 天内仍会显示，之后默认隐藏。');
 }
+"""
+
+PROGRESSIVE_TABLE_JS = """
+function applyProgressiveTable(button) {
+  var group = button.dataset.progressiveGroup;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('[data-progressive-group="' + group + '"]'));
+  var visibleCount = parseInt(button.dataset.visibleCount || '0', 10);
+  rows.forEach(function (row, index) {
+    row.style.display = index < visibleCount ? '' : 'none';
+  });
+  var remaining = Math.max(rows.length - visibleCount, 0);
+  button.style.display = remaining > 0 ? '' : 'none';
+  button.textContent = remaining > 0 ? '显示更多（剩余 ' + remaining + ' 条）' : '已全部显示';
+}
+function initProgressiveTables() {
+  document.querySelectorAll('[data-progressive-more]').forEach(function (button) {
+    if (!button.dataset.visibleCount) {
+      button.dataset.visibleCount = button.dataset.initialCount || button.dataset.progressiveStep || '10';
+    }
+    applyProgressiveTable(button);
+  });
+  if (typeof updateBulkCloseState === 'function') updateBulkCloseState();
+}
+document.addEventListener('DOMContentLoaded', initProgressiveTables);
+document.addEventListener('click', function (e) {
+  var button = e.target.closest('[data-progressive-more]');
+  if (!button) return;
+  var step = parseInt(button.dataset.progressiveStep || '10', 10);
+  var visibleCount = parseInt(button.dataset.visibleCount || button.dataset.initialCount || step, 10);
+  button.dataset.visibleCount = visibleCount + step;
+  applyProgressiveTable(button);
+  if (typeof updateBulkCloseState === 'function') updateBulkCloseState();
+});
 """
 
 COPY_TODAY_TEXT_JS = """
@@ -2215,7 +2306,7 @@ def catalog_script() -> str:
 
 
 def admin_script() -> str:
-    return catalog_script() + "<script>" + BULK_ADMIN_JS + COPY_TODAY_TEXT_JS + "</script>"
+    return catalog_script() + "<script>" + BULK_ADMIN_JS + PROGRESSIVE_TABLE_JS + COPY_TODAY_TEXT_JS + "</script>"
 
 
 def search_script() -> str:
@@ -2223,7 +2314,7 @@ def search_script() -> str:
 
 
 def personal_script() -> str:
-    return catalog_script() + "<script>" + DIAGNOSTIC_LOG_JS + "</script>"
+    return catalog_script() + "<script>" + PROGRESSIVE_TABLE_JS + DIAGNOSTIC_LOG_JS + "</script>"
 
 
 def claim_totals(conn: sqlite3.Connection, payment_id: int) -> dict[str, int]:
@@ -3498,7 +3589,6 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
             JOIN payments p ON p.id = c.payment_id
             WHERE c.actor_id = ?
             ORDER BY c.id DESC
-            LIMIT 100
             """,
             (actor["id"],),
         ).fetchall()
@@ -3544,7 +3634,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
 
     if my_claims:
         rows = []
-        for r in my_claims:
+        for index, r in enumerate(my_claims):
             if r["c_status"] == "accepted":
                 state = '<span class="status claimed">已认领</span>'
             elif r["c_status"] == "pending":
@@ -3567,9 +3657,10 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
                   <button class="danger" type="submit">取消认领</button>
                 </form>
                 """
+            row_style = ' style="display:none"' if index >= 20 else ""
             rows.append(
                 f"""
-                <tr>
+                <tr data-progressive-group="my-claims"{row_style}>
                   <td class="nowrap">{esc(r["received_date"])}</td>
                   <td>
                     <strong>{esc(r["payer_name"])}</strong>
@@ -3582,12 +3673,20 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
                 </tr>
                 """
             )
+        more_button = (
+            '<div style="padding:12px 0 0; text-align:center"><button type="button" class="secondary" '
+            'data-progressive-more data-progressive-group="my-claims" data-progressive-step="20" '
+            'data-initial-count="20" data-visible-count="20">显示更多</button></div>'
+            if len(my_claims) > 20
+            else ""
+        )
         claims_html = f"""
         <div class="table-wrap">
         <table>
           <thead><tr><th>到款日期</th><th>付款方 / 到款公司 / 备注</th><th>部门 / 中心 / 项目</th><th>提交时间</th><th>当前状态</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
+        {more_button}
         </div>
         """
     else:
@@ -5271,15 +5370,24 @@ def cancel_my_claim(
         raise HTTPException(status_code=409, detail="这条认领当前不能取消")
 
     payment_id = int(claim["payment_id"])
+    payment_before = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
     conn.execute("UPDATE claims SET status = 'canceled' WHERE id = ?", (claim_id,))
     refresh_payment_claim_status(conn, payment_id)
     payment = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    notify_detail = notify_admins_claim_canceled(
+        conn,
+        payment_before or payment,
+        claim,
+        actor,
+        payment["status"] if payment else "",
+    )
     detail = {
         "claim_id": claim_id,
         "payment_id": payment_id,
         "previous_status": claim["status"],
         "payment_status": payment["status"] if payment else "",
         "amount_cents": claim["amount_cents"],
+        **notify_detail,
     }
     audit(conn, actor, "cancel_my_claim", payment_id, detail, request)
     return detail
