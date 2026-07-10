@@ -163,7 +163,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["receiver_company"], "北京蒲公英教育科技有限公司")
 
-    def test_duplicate_exists_ignores_closed_payments(self) -> None:
+    def test_duplicate_exists_uses_serial_number_and_ignores_closed_payments(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -194,16 +194,31 @@ class ExcelImportTests(unittest.TestCase):
             (1, "2026-07-01", "北京测试学校", 100000, "报名费", "SERIAL-001", "closed"),
         )
 
-        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial, 100000))
+        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial))
         conn.execute("UPDATE payments SET status = 'pending' WHERE id = 1")
-        self.assertTrue(self.app.duplicate_exists(conn, item_with_serial, 100000))
+        self.assertTrue(self.app.duplicate_exists(conn, item_with_serial))
 
-        conn.execute("DELETE FROM payments")
+    def test_duplicate_exists_keeps_identical_rows_without_serial_number(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE payments (
+                id INTEGER PRIMARY KEY,
+                received_date TEXT,
+                payer_name TEXT,
+                amount_cents INTEGER NOT NULL,
+                bank_note TEXT,
+                serial_no TEXT,
+                status TEXT NOT NULL
+            );
+            """
+        )
         item_without_serial = {
-            "received_date": "2026-07-01",
-            "payer_name": "北京测试学校",
-            "amount": "1000",
-            "bank_note": "报名费",
+            "received_date": "2026-07-10",
+            "payer_name": "银联POS款",
+            "amount": "1780",
+            "bank_note": "哈尔滨市博雅中学校班主任峰会",
             "serial_no": "",
         }
         conn.execute(
@@ -211,12 +226,10 @@ class ExcelImportTests(unittest.TestCase):
             INSERT INTO payments (id, received_date, payer_name, amount_cents, bank_note, serial_no, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (2, "2026-07-01", "北京测试学校", 100000, "报名费", "", "closed"),
+            (2, "2026-07-10", "银联POS款", 178000, "哈尔滨市博雅中学校班主任峰会", "", "pending"),
         )
 
-        self.assertFalse(self.app.duplicate_exists(conn, item_without_serial, 100000))
-        conn.execute("UPDATE payments SET status = 'pending' WHERE id = 2")
-        self.assertTrue(self.app.duplicate_exists(conn, item_without_serial, 100000))
+        self.assertFalse(self.app.duplicate_exists(conn, item_without_serial))
 
     def test_bulk_close_payments_skips_closed_and_logs(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -907,7 +920,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(audit_row["action"], "repair_pending_claims_to_accepted")
         self.assertEqual(audit_row["payment_id"], 1)
 
-    def test_submit_split_claims_creates_accepted_lines_and_refreshes_payment(self) -> None:
+    def test_submit_split_claims_accepts_refund_lines_and_refreshes_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -975,8 +988,8 @@ class ExcelImportTests(unittest.TestCase):
             [department, department],
             [team, team],
             [projects[0], projects[1]],
-            ["60", "40"],
-            ["2本杂志", "2个参会名额"],
+            ["120", "-20"],
+            ["项目收入", "项目退款"],
         )
 
         payment = conn.execute("SELECT status, finance_note FROM payments WHERE id = 1").fetchone()
@@ -988,10 +1001,45 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(detail["payment_status"], "claimed")
         self.assertEqual(payment["status"], "claimed")
         self.assertEqual(payment["finance_note"], "部分认领金额已覆盖整笔到款")
-        self.assertEqual([row["amount_cents"] for row in claim_rows], [6000, 4000])
+        self.assertEqual([row["amount_cents"] for row in claim_rows], [12000, -2000])
         self.assertEqual([row["status"] for row in claim_rows], ["accepted", "accepted"])
-        self.assertEqual([row["note"] for row in claim_rows], ["2本杂志", "2个参会名额"])
+        self.assertEqual([row["note"] for row in claim_rows], ["项目收入", "项目退款"])
         self.assertEqual(audit_row["action"], "split_claim_submit")
+
+        conn.execute(
+            """
+            INSERT INTO payments
+                (id, amount_cents, status, claimed_department, claimed_team, claimed_by,
+                 claimed_by_name, claimed_at, customer_project, claim_note, finance_note)
+            VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (2, 10000, "pending"),
+        )
+        with self.assertRaises(self.app.HTTPException) as negative_only:
+            self.app.submit_split_claims(
+                conn,
+                actor,
+                2,
+                [department],
+                [team],
+                [projects[0]],
+                ["-20"],
+                ["仅退款"],
+            )
+        self.assertEqual(negative_only.exception.detail, "分摊金额合计必须大于 0")
+
+        with self.assertRaises(self.app.HTTPException) as zero_amount:
+            self.app.submit_split_claims(
+                conn,
+                actor,
+                2,
+                [department],
+                [team],
+                [projects[0]],
+                ["0"],
+                ["零金额"],
+            )
+        self.assertEqual(zero_amount.exception.detail, "第 1 行分摊金额不能为 0，退款请填负数")
 
     def test_submit_batch_claims_creates_one_accepted_claim_per_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -1322,7 +1370,9 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(html.count('class="split-row-number"'), 6)
         self.assertIn('class="secondary split-add-row"', html)
         self.assertIn("＋ 添加分摊行", html)
+        self.assertIn("退款项目请填负数", html)
         self.assertIn("addSplitClaimRow", self.app.CASCADE_JS)
+        self.assertIn("退款填负数", self.app.CASCADE_JS)
         self.assertIn("createProjectInput", self.app.CASCADE_JS)
 
     def test_admin_payment_sort_clause_is_whitelisted(self) -> None:
@@ -2049,9 +2099,10 @@ class ExcelImportTests(unittest.TestCase):
             "INSERT INTO claims (id, payment_id, department, actor_id, amount_cents, status) VALUES (?, ?, ?, ?, ?, ?)",
             [
                 (1, 2, department, "user-a", 20000, "accepted"),
-                (2, 3, department, "user-b", 12000, "pending"),
+                (2, 3, department, "user-b", 15000, "pending"),
                 (3, 3, other_department, "user-c", 18000, "pending"),
                 (4, 4, department, "user-a", 99900, "accepted"),
+                (5, 3, department, "user-b", -3000, "pending"),
             ],
         )
         today = date(2026, 6, 25)
@@ -2141,13 +2192,14 @@ class ExcelImportTests(unittest.TestCase):
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, 1, "学生发展事业部", "咖啡收入", 40540, "accepted"),
+                (1, 1, "学生发展事业部", "咖啡收入", 45540, "accepted"),
                 (2, 1, "学生发展事业部", "产品与文创", 15200, "pending"),
                 (3, 2, "学生发展事业部", "阅读创新", 59130, "accepted"),
                 (4, 3, "教育智能研究院", "云智库地图", 60600, "accepted"),
                 (5, 3, "教育智能研究院", "家长认知与行为地图", 3600, "pending"),
                 (6, 5, "学生发展事业部", "已取消项目", 99900, "canceled"),
                 (7, 6, "学生发展事业部", "明日项目", 10000, "accepted"),
+                (8, 1, "学生发展事业部", "项目退款", -5000, "accepted"),
             ],
         )
 
@@ -2159,7 +2211,7 @@ class ExcelImportTests(unittest.TestCase):
                 [
                     "7月1日",
                     "",
-                    "1.银联POS款\t1,148.70元（学生发展事业部  咖啡收入405.40元，产品与文创152.00元，阅读创新591.30元）",
+                    "1.银联POS款\t1,148.70元（学生发展事业部  咖啡收入455.40元，产品与文创152.00元，项目退款-50.00元，阅读创新591.30元）",
                     "2.南京工业大学实验小学\t642.00元（教育智能研究院  云智库地图606.00元，家长认知与行为地图36.00元）",
                     "3.未认领客户\t200.00元（未认领）",
                     "今日合计：1,990.70元",

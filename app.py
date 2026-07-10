@@ -1671,31 +1671,14 @@ def rows_from_pdf(path: Path) -> tuple[list[dict[str, str]], str]:
 
 
 
-def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str], amount_cents: int) -> bool:
+def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str]) -> bool:
     serial_no = item.get("serial_no", "").strip()
-    if serial_no:
-        row = conn.execute(
-            "SELECT id FROM payments WHERE serial_no = ? AND status != 'closed' LIMIT 1",
-            (serial_no,),
-        ).fetchone()
-        if row:
-            return True
+    # POS 汇总流水可能同日、同额且摘要相同，无流水号时不自动判重。
+    if not serial_no:
+        return False
     row = conn.execute(
-        """
-        SELECT id FROM payments
-        WHERE received_date = ?
-          AND payer_name = ?
-          AND amount_cents = ?
-          AND COALESCE(bank_note, '') = ?
-          AND status != 'closed'
-        LIMIT 1
-        """,
-        (
-            parse_date(item.get("received_date")),
-            item.get("payer_name", "").strip(),
-            amount_cents,
-            item.get("bank_note", "").strip(),
-        ),
+        "SELECT id FROM payments WHERE serial_no = ? AND status != 'closed' LIMIT 1",
+        (serial_no,),
     ).fetchone()
     return row is not None
 
@@ -1981,7 +1964,7 @@ function addSplitClaimRow(button) {
   var amountCell = document.createElement('td');
   var amountInput = document.createElement('input');
   amountInput.name = 'amounts';
-  amountInput.placeholder = '0.00';
+  amountInput.placeholder = '0.00 / 退款填负数';
   amountCell.appendChild(amountInput);
   row.appendChild(amountCell);
 
@@ -2540,7 +2523,7 @@ def split_claim_line_rows(count: int = 6) -> str:
               <td>{department_select("departments", required=False, class_name="cs-dept")}</td>
               <td>{team_select("teams", "", required=False)}</td>
               <td>{project_select("projects", "", "", required=False)}</td>
-              <td><input name="amounts" placeholder="0.00"></td>
+              <td><input name="amounts" placeholder="0.00 / 退款填负数"></td>
               <td><input name="notes" placeholder="如：2本杂志 / 3个笔记本 / 2个参会名额"></td>
             </tr>
             """
@@ -2565,7 +2548,7 @@ def split_claim_form_html(row: sqlite3.Row) -> str:
             </table>
           </div>
           <button type="button" class="secondary split-add-row" style="margin:0 0 12px">＋ 添加分摊行</button>
-          <p class="hint" style="margin:0 0 12px">只填写需要分摊的行；分摊金额合计不能超过该笔款剩余可认领金额。</p>
+          <p class="hint" style="margin:0 0 12px">只填写需要分摊的行，退款项目请填负数；分摊净额合计必须大于 0，且不能超过该笔款剩余可认领金额。</p>
           <button type="submit">提交分摊认领</button>
         </form>
       </div>
@@ -2627,8 +2610,8 @@ def submit_split_claims(
         if project not in CATALOG[department][team]:
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 行项目不属于所选中心/小组")
         amount_cents = parse_amount(amount_text)
-        if amount_cents <= 0:
-            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行分摊金额必须大于 0")
+        if amount_cents == 0:
+            raise HTTPException(status_code=400, detail=f"第 {index + 1} 行分摊金额不能为 0，退款请填负数")
         lines.append(
             {
                 "department": department,
@@ -2643,6 +2626,8 @@ def submit_split_claims(
         raise HTTPException(status_code=400, detail="请至少填写一条分摊明细")
     totals = claim_totals(conn, payment_id)
     new_total = sum(line["amount_cents"] for line in lines)
+    if new_total <= 0:
+        raise HTTPException(status_code=400, detail="分摊金额合计必须大于 0")
     if totals["active"] + new_total > payment["amount_cents"]:
         raise HTTPException(status_code=409, detail="分摊金额合计超过该笔款剩余可认领金额")
 
@@ -3285,7 +3270,7 @@ def dashboard_entries(
             active_sum = 0
             for claim in payment["claims"]:
                 amount = claim["amount_cents"]
-                if amount <= 0:
+                if amount == 0:
                     continue
                 active_sum += amount
                 entries.append(
@@ -3364,7 +3349,7 @@ def dashboard_entries(
             "amount_cents": row["amount_cents"] or 0,
         }
         for row in rows
-        if (row["amount_cents"] or 0) > 0
+        if (row["amount_cents"] or 0) != 0
     ]
 
 
@@ -3375,7 +3360,7 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
     total = 0
     for entry in entries:
         amount = int(entry.get("amount_cents") or 0)
-        if amount <= 0:
+        if amount == 0:
             continue
         total += amount
         payer_name = str(entry.get("payer_name") or "未填写付款方")
@@ -4123,7 +4108,7 @@ def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: 
         department = (row["department"] or "").strip() or "未填写部门"
         project = (row["customer_project"] or "").strip() or "未填写项目"
         amount_cents = int(row["amount_cents"] or 0)
-        if amount_cents <= 0:
+        if amount_cents == 0:
             continue
 
         payer_item = payer_items.setdefault(payer, {"total": 0, "departments": {}})
@@ -4919,7 +4904,7 @@ def admin_import(
         skipped = 0
         for item in rows:
             amount_cents = parse_amount(item.get("amount"))
-            if duplicate_exists(conn, item, amount_cents):
+            if duplicate_exists(conn, item):
                 skipped += 1
                 continue
             received_date = parse_date(item.get("received_date"))
