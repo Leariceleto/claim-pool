@@ -238,9 +238,19 @@ def refresh_catalog(conn: Optional[sqlite3.Connection] = None) -> None:
     catalog_conn = conn or get_conn()
     try:
         rows = catalog_conn.execute(
-            "SELECT department, team, project, active FROM catalog_project_changes ORDER BY id"
+            "SELECT change_type, department, team, project, active FROM catalog_project_changes ORDER BY id"
         ).fetchall()
         for row in rows:
+            if not row["active"]:
+                continue
+            if row["change_type"] == "department":
+                CATALOG.setdefault(row["department"], {})
+            elif row["change_type"] == "team" and row["department"] in CATALOG:
+                CATALOG[row["department"]].setdefault(row["team"], [])
+        DEPARTMENTS[:] = list(CATALOG)
+        for row in rows:
+            if row["change_type"] != "project":
+                continue
             projects = CATALOG.get(row["department"], {}).get(row["team"])
             if projects is None:
                 continue
@@ -352,6 +362,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS catalog_project_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                change_type TEXT NOT NULL DEFAULT 'project',
                 department TEXT NOT NULL,
                 team TEXT NOT NULL,
                 project TEXT NOT NULL,
@@ -374,6 +385,12 @@ def init_db() -> None:
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "app_users", "managed_role", "managed_role TEXT NOT NULL DEFAULT 'claimant'")
+        ensure_column(
+            conn,
+            "catalog_project_changes",
+            "change_type",
+            "change_type TEXT NOT NULL DEFAULT 'project'",
+        )
         repair_compact_payment_dates(conn)
         conn.execute(
             "UPDATE payments SET closed_at = ? WHERE status = 'closed' AND COALESCE(closed_at, '') = ''",
@@ -4189,6 +4206,8 @@ def admin_notice_html(notice: str, imported: int = 0, skipped: int = 0) -> str:
             f'<strong>导入成功</strong><br>已导入 {esc(imported)} 条流水，跳过 {esc(skipped)} 条重复或无效记录。'
             '</div>'
         )
+    if notice == "catalog_updated":
+        return '<div class="callout success"><strong>目录更新成功</strong></div>'
     return ""
 
 
@@ -4528,6 +4547,21 @@ def admin_page(
 
     <h2>项目管理</h2>
     <div class="panel">
+      <div style="font-weight:600; margin-bottom:12px">组织架构</div>
+      <div class="row" style="align-items:end">
+        <form method="post" action="/admin/catalog/departments" class="row" style="align-items:end; flex:1; min-width:300px">
+          {finance_hidden(actor)}
+          <div style="min-width:220px; flex:1"><label>新部门名称</label><input name="department" maxlength="100" required></div>
+          <div><button type="submit">添加部门</button></div>
+        </form>
+        <form method="post" action="/admin/catalog/teams" class="row" style="align-items:end; flex:1.5; min-width:420px">
+          {finance_hidden(actor)}
+          <div style="min-width:180px; flex:1"><label>所属部门</label>{department_select("department", required=True, class_name="cs-dept")}</div>
+          <div style="min-width:220px; flex:1.2"><label>新中心 / 小组名称</label><input name="team" maxlength="100" required></div>
+          <div><button type="submit">添加中心/小组</button></div>
+        </form>
+      </div>
+      <div style="font-weight:600; border-top:1px solid var(--line); margin-top:18px; padding-top:18px">项目</div>
       <form method="post" action="/admin/catalog/projects" class="row" style="align-items:end">
         {finance_hidden(actor)}
         <input type="hidden" name="action" value="add">
@@ -4679,6 +4713,102 @@ def admin_system_page(request: Request) -> HTMLResponse:
     return page("管理后台", body, active="system", subtitle="管理成员部门、身份与操作日志", actor=actor)
 
 
+def normalize_catalog_name(value: str, label: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value or len(value) > 100:
+        raise HTTPException(status_code=400, detail=f"{label}需为 1-100 个字符")
+    return value
+
+
+def save_catalog_change(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    change_type: str,
+    department: str,
+    team: str,
+    project: str,
+    active: int,
+    audit_action: str,
+    request: Optional[Request] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO catalog_project_changes
+            (change_type, department, team, project, active, updated_at, updated_by, updated_by_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(department, team, project) DO UPDATE SET
+            change_type = excluded.change_type,
+            active = excluded.active,
+            updated_at = excluded.updated_at,
+            updated_by = excluded.updated_by,
+            updated_by_name = excluded.updated_by_name
+        """,
+        (change_type, department, team, project, active, now_text(), actor["id"], actor["name"]),
+    )
+    audit(
+        conn,
+        actor,
+        audit_action,
+        None,
+        {"department": department, "team": team, "project": project},
+        request,
+    )
+
+
+@app.post("/admin/catalog/departments")
+def admin_catalog_department(
+    request: Request,
+    department: str = Form(...),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    department = normalize_catalog_name(department, "部门名称")
+    if department in CATALOG:
+        raise HTTPException(status_code=409, detail="该部门已存在")
+    with get_conn() as conn:
+        save_catalog_change(
+            conn,
+            actor,
+            "department",
+            department,
+            "",
+            "",
+            1,
+            "add_catalog_department",
+            request,
+        )
+    refresh_catalog()
+    return RedirectResponse("/admin?notice=catalog_updated", status_code=303)
+
+
+@app.post("/admin/catalog/teams")
+def admin_catalog_team(
+    request: Request,
+    department: str = Form(...),
+    team: str = Form(...),
+) -> RedirectResponse:
+    actor = actor_from_request(request)
+    require_admin(actor)
+    department = require_department(department)
+    team = normalize_catalog_name(team, "中心/小组名称")
+    if team in CATALOG.get(department, {}):
+        raise HTTPException(status_code=409, detail="该中心/小组已存在")
+    with get_conn() as conn:
+        save_catalog_change(
+            conn,
+            actor,
+            "team",
+            department,
+            team,
+            "",
+            1,
+            "add_catalog_team",
+            request,
+        )
+    refresh_catalog()
+    return RedirectResponse("/admin?notice=catalog_updated", status_code=303)
+
+
 @app.post("/admin/catalog/projects")
 def admin_catalog_project(
     request: Request,
@@ -4692,7 +4822,7 @@ def admin_catalog_project(
     department = require_department(department)
     team = team.strip()
     project = re.sub(r"\s+", " ", project).strip()
-    if team not in BASE_CATALOG.get(department, {}):
+    if team not in CATALOG.get(department, {}):
         raise HTTPException(status_code=400, detail="请选择该部门下的现有中心/小组")
     if not project or len(project) > 100:
         raise HTTPException(status_code=400, detail="项目名称需为 1-100 个字符")
@@ -4713,32 +4843,19 @@ def admin_catalog_project(
         raise HTTPException(status_code=400, detail="项目操作不合法")
 
     with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO catalog_project_changes
-                (department, team, project, active, updated_at, updated_by, updated_by_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(department, team, project) DO UPDATE SET
-                active = excluded.active,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by,
-                updated_by_name = excluded.updated_by_name
-            """,
-            (department, team, project, active, now_text(), actor["id"], actor["name"]),
-        )
-        audit(
+        save_catalog_change(
             conn,
             actor,
+            "project",
+            department,
+            team,
+            project,
+            active,
             audit_action,
-            None,
-            {"department": department, "team": team, "project": project},
             request,
         )
     refresh_catalog()
-    return RedirectResponse(
-        f"/admin?notice=import_success&imported={imported}&skipped={skipped}",
-        status_code=303,
-    )
+    return RedirectResponse("/admin?notice=catalog_updated", status_code=303)
 
 
 def finance_hidden(actor: dict[str, str]) -> str:

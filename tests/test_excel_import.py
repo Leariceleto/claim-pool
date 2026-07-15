@@ -1357,6 +1357,113 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn(f'<option value="{project}"></option>', html)
         self.assertNotIn("<select", html)
 
+    def test_admin_can_add_catalog_department_team_and_project_from_legacy_db(self) -> None:
+        old_db_path = self.app.DB_PATH
+        old_actor_from_request = self.app.actor_from_request
+        old_catalog = {
+            department: {team: list(projects) for team, projects in teams.items()}
+            for department, teams in self.app.CATALOG.items()
+        }
+        old_departments = list(self.app.DEPARTMENTS)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self.app.DB_PATH = Path(tmpdir) / "catalog-structure.db"
+                legacy_conn = sqlite3.connect(self.app.DB_PATH)
+                legacy_conn.executescript(
+                    """
+                    CREATE TABLE catalog_project_changes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        department TEXT NOT NULL,
+                        team TEXT NOT NULL,
+                        project TEXT NOT NULL,
+                        active INTEGER NOT NULL DEFAULT 1,
+                        updated_at TEXT NOT NULL,
+                        updated_by TEXT NOT NULL,
+                        updated_by_name TEXT NOT NULL,
+                        UNIQUE(department, team, project)
+                    );
+                    """
+                )
+                legacy_conn.close()
+                self.app.init_db()
+
+                actor = {
+                    "id": "catalog-admin",
+                    "name": "目录管理员",
+                    "role": "admin",
+                    "department": "财务部",
+                    "team": "",
+                    "authed": "1",
+                }
+                self.app.actor_from_request = lambda request: actor
+                request = types.SimpleNamespace(
+                    headers={},
+                    client=types.SimpleNamespace(host="127.0.0.91"),
+                    cookies={},
+                    query_params={},
+                    url=types.SimpleNamespace(scheme="http"),
+                )
+
+                department_response = self.app.admin_catalog_department(request, "测试新部门")
+                team_response = self.app.admin_catalog_team(request, "测试新部门", "测试新中心")
+                project_response = self.app.admin_catalog_project(
+                    request,
+                    "add",
+                    "测试新部门",
+                    "测试新中心",
+                    "测试新项目",
+                )
+
+                self.assertEqual(department_response.headers["location"], "/admin?notice=catalog_updated")
+                self.assertEqual(team_response.headers["location"], "/admin?notice=catalog_updated")
+                self.assertEqual(project_response.headers["location"], "/admin?notice=catalog_updated")
+                self.assertIn("测试新部门", self.app.DEPARTMENTS)
+                self.assertIn("测试新中心", self.app.CATALOG["测试新部门"])
+                self.assertIn("测试新项目", self.app.CATALOG["测试新部门"]["测试新中心"])
+
+                with self.app.get_conn() as conn:
+                    columns = [row[1] for row in conn.execute("PRAGMA table_info(catalog_project_changes)")]
+                    changes = conn.execute(
+                        "SELECT change_type, department, team, project FROM catalog_project_changes ORDER BY id"
+                    ).fetchall()
+                    actions = [
+                        row["action"]
+                        for row in conn.execute(
+                            "SELECT action FROM audit_logs WHERE actor_id = ? ORDER BY id",
+                            (actor["id"],),
+                        ).fetchall()
+                    ]
+                self.assertIn("change_type", columns)
+                self.assertEqual(
+                    [tuple(row) for row in changes],
+                    [
+                        ("department", "测试新部门", "", ""),
+                        ("team", "测试新部门", "测试新中心", ""),
+                        ("project", "测试新部门", "测试新中心", "测试新项目"),
+                    ],
+                )
+                self.assertEqual(
+                    actions,
+                    ["add_catalog_department", "add_catalog_team", "add_catalog_project"],
+                )
+
+                html = self.app.admin_page(request).body.decode("utf-8")
+                self.assertIn('action="/admin/catalog/departments"', html)
+                self.assertIn('action="/admin/catalog/teams"', html)
+                self.assertIn("新部门名称", html)
+                self.assertIn("新中心 / 小组名称", html)
+                self.assertIn("目录更新成功", self.app.admin_notice_html("catalog_updated"))
+
+                with self.assertRaises(self.app.HTTPException) as duplicate_department:
+                    self.app.admin_catalog_department(request, "测试新部门")
+                self.assertEqual(duplicate_department.exception.status_code, 409)
+        finally:
+            self.app.actor_from_request = old_actor_from_request
+            self.app.DB_PATH = old_db_path
+            self.app.CATALOG.clear()
+            self.app.CATALOG.update(old_catalog)
+            self.app.DEPARTMENTS[:] = old_departments
+
     def test_split_claim_form_can_add_more_rows_client_side(self) -> None:
         row = {
             "id": 66,
