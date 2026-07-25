@@ -2182,7 +2182,10 @@ class ExcelImportTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY,
                 payment_id INTEGER NOT NULL,
                 department TEXT NOT NULL,
+                team TEXT,
                 actor_id TEXT NOT NULL,
+                actor_name TEXT,
+                customer_project TEXT,
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL
             );
@@ -2203,13 +2206,17 @@ class ExcelImportTests(unittest.TestCase):
         department = self.app.DEPARTMENTS[0]
         other_department = self.app.DEPARTMENTS[1] if len(self.app.DEPARTMENTS) > 1 else "其他部门"
         conn.executemany(
-            "INSERT INTO claims (id, payment_id, department, actor_id, amount_cents, status) VALUES (?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO claims
+                (id, payment_id, department, team, actor_id, actor_name, customer_project, amount_cents, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             [
-                (1, 2, department, "user-a", 20000, "accepted"),
-                (2, 3, department, "user-b", 15000, "pending"),
-                (3, 3, other_department, "user-c", 18000, "pending"),
-                (4, 4, department, "user-a", 99900, "accepted"),
-                (5, 3, department, "user-b", -3000, "pending"),
+                (1, 2, department, "会议中心", "user-a", "张三", "项目A", 20000, "accepted"),
+                (2, 3, department, "项目主理", "user-b", "李四", "项目B", 15000, "pending"),
+                (3, 3, other_department, "创新中心", "user-c", "王五", "项目C", 18000, "pending"),
+                (4, 4, department, "会议中心", "user-a", "张三", "项目D", 99900, "accepted"),
+                (5, 3, department, "项目主理", "user-b", "李四", "退款项目", -3000, "pending"),
             ],
         )
         today = date(2026, 6, 25)
@@ -2256,6 +2263,12 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn(("年会客户A", 20000), user_department_dashboard["customers"])
         self.assertTrue(all(row["department"] == department for row in user_department_dashboard["rows"]))
         self.assertFalse(any(row["department"] == other_department for row in user_department_dashboard["rows"]))
+        project_row = next(row for row in user_department_dashboard["rows"] if row["customer_project"] == "项目B")
+        self.assertEqual(project_row["team"], "项目主理")
+        self.assertEqual(project_row["actor_name"], "李四")
+        detail_html = self.app.render_dashboard_rows([project_row])
+        self.assertIn("查看认领信息", detail_html)
+        self.assertIn(f"{department} · 项目主理 · 项目B · 李四 · ¥ 150.00", detail_html)
         self.assertEqual(user_all_dashboard["total_cents"], 50000)
         self.assertIn((department, 32000), user_all_dashboard["departments"])
         self.assertIn((other_department, 18000), user_all_dashboard["departments"])

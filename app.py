@@ -1129,6 +1129,9 @@ BASE_CSS = """
     .dash-table td, .dash-table th { white-space:normal; overflow-wrap:anywhere; }
     .dash-table td:last-child, .dash-table th:last-child { padding-right:18px; text-align:right; }
     .dash-table .num { font-weight:650; white-space:nowrap; }
+    .dash-claim-details { margin-top:5px; color:var(--muted); font-size:11.5px; line-height:1.55; }
+    .dash-claim-details summary { width:max-content; max-width:100%; color:var(--primary); cursor:pointer; }
+    .dash-claim-details div { margin-top:3px; overflow-wrap:anywhere; }
     .diagnostic-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px; }
     .copy-status { color:#16a34a; font-size:12.5px; min-height:18px; }
     .modal-backdrop { position:fixed; inset:0; z-index:100; background:rgba(15,23,42,.42);
@@ -1145,7 +1148,22 @@ BASE_CSS = """
       .brand-text small { display:none; }
       .admin-stat-grid { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
       table { min-width:680px; }
-      .dash-table { min-width:0; }
+      .dash-table-wrap { overflow-x:hidden; }
+      .dash-table { display:block; min-width:0; }
+      .dash-table colgroup, .dash-table thead { display:none; }
+      .dash-table tbody { display:block; }
+      .dash-table tr { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 12px;
+        padding:12px 0; border-bottom:1px solid var(--line); }
+      .dash-table tr:last-child { border-bottom:0; }
+      .dash-table td { display:block; min-width:0; padding:0; border:0; }
+      .dash-table td:first-child { grid-column:1; grid-row:1; font-weight:600; }
+      .dash-table td:nth-child(2), .dash-table td:nth-child(3), .dash-table td:nth-child(4) {
+        grid-column:1 / -1; color:var(--muted); }
+      .dash-table td:nth-child(2)::before { content:"到款公司："; }
+      .dash-table td:nth-child(3)::before { content:"摘要："; }
+      .dash-table td:nth-child(4)::before { content:"所属部门："; }
+      .dash-table td:last-child { grid-column:2; grid-row:1; padding:0; text-align:right; }
+      .dash-claim-details { color:var(--muted); }
     }
 """
 
@@ -3250,7 +3268,9 @@ def dashboard_entries(
         rows = conn.execute(
             f"""
             SELECT p.id, p.payer_name, p.bank_note, p.receiver_company, p.amount_cents, p.claimed_department,
-                   c.department AS claim_department, c.amount_cents AS claim_amount
+                   c.department AS claim_department, c.team AS claim_team,
+                   c.customer_project AS claim_project, c.actor_name AS claim_actor_name,
+                   c.amount_cents AS claim_amount
             FROM payments p
             LEFT JOIN claims c
               ON c.payment_id = p.id
@@ -3278,6 +3298,9 @@ def dashboard_entries(
                 payment["claims"].append(
                     {
                         "department": row["claim_department"],
+                        "team": row["claim_team"] or "",
+                        "customer_project": row["claim_project"] or "",
+                        "actor_name": row["claim_actor_name"] or "",
                         "amount_cents": row["claim_amount"] or 0,
                     }
                 )
@@ -3296,7 +3319,11 @@ def dashboard_entries(
                         "bank_note": payment["bank_note"],
                         "receiver_company": payment["receiver_company"],
                         "department": claim["department"] or "未认领",
+                        "team": claim["team"],
+                        "customer_project": claim["customer_project"],
+                        "actor_name": claim["actor_name"],
                         "amount_cents": amount,
+                        "is_claim": True,
                     }
                 )
             remaining = max(payment["amount_cents"] - active_sum, 0)
@@ -3308,7 +3335,11 @@ def dashboard_entries(
                         "bank_note": payment["bank_note"],
                         "receiver_company": payment["receiver_company"],
                         "department": department or "未认领",
+                        "team": "",
+                        "customer_project": "",
+                        "actor_name": "",
                         "amount_cents": remaining,
+                        "is_claim": False,
                     }
                 )
         return entries
@@ -3346,7 +3377,8 @@ def dashboard_entries(
 
     rows = conn.execute(
         f"""
-        SELECT p.payer_name, p.bank_note, p.receiver_company, c.department, c.amount_cents
+        SELECT p.payer_name, p.bank_note, p.receiver_company, c.department, c.team,
+               c.customer_project, c.actor_name, c.amount_cents
         FROM claims c
         JOIN payments p ON p.id = c.payment_id
         WHERE c.status IN ({",".join("?" for _ in active_claim_statuses)})
@@ -3363,7 +3395,11 @@ def dashboard_entries(
             "bank_note": row["bank_note"] or "",
             "receiver_company": row["receiver_company"] or "",
             "department": row["department"] or "未认领",
+            "team": row["team"] or "",
+            "customer_project": row["customer_project"] or "",
+            "actor_name": row["actor_name"] or "",
             "amount_cents": row["amount_cents"] or 0,
+            "is_claim": True,
         }
         for row in rows
         if (row["amount_cents"] or 0) != 0
@@ -3384,6 +3420,9 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
         bank_note = str(entry.get("bank_note") or "")
         receiver_company = str(entry.get("receiver_company") or "")
         department = str(entry.get("department") or "未认领")
+        team = str(entry.get("team") or "")
+        customer_project = str(entry.get("customer_project") or "")
+        actor_name = str(entry.get("actor_name") or "")
         customers[payer_name] = customers.get(payer_name, 0) + amount
         departments[department] = departments.get(department, 0) + amount
         rows.append(
@@ -3392,7 +3431,11 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
                 "bank_note": bank_note,
                 "receiver_company": receiver_company,
                 "department": department,
+                "team": team,
+                "customer_project": customer_project,
+                "actor_name": actor_name,
                 "amount_cents": amount,
+                "is_claim": bool(entry.get("is_claim")),
             }
         )
 
@@ -3432,12 +3475,31 @@ def personal_dashboard_data(
 def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return '<div class="dash-table-wrap"><div class="muted" style="padding:12px 0">暂无款项数据</div></div>'
+    def claim_details(row: dict[str, Any]) -> str:
+        if not row.get("is_claim"):
+            return ""
+        parts = [
+            str(row.get("department") or "").strip(),
+            str(row.get("team") or "").strip(),
+            str(row.get("customer_project") or "").strip(),
+            str(row.get("actor_name") or "").strip(),
+        ]
+        detail = " · ".join(esc(part) for part in parts if part)
+        if not detail:
+            return ""
+        return f"""
+        <details class="dash-claim-details">
+          <summary>查看认领信息</summary>
+          <div>{detail} · ¥ {money(row["amount_cents"])}</div>
+        </details>
+        """
+
     body = "".join(
         f"""
         <tr>
           <td>{esc(row["payer_name"])}</td>
           <td>{esc(receiver_company_label(row.get("receiver_company")))}</td>
-          <td>{esc(row.get("bank_note") or "")}</td>
+          <td>{esc(row.get("bank_note") or "")}{claim_details(row)}</td>
           <td>{esc(row["department"])}</td>
           <td class="num">¥ {money(row["amount_cents"])}</td>
         </tr>
