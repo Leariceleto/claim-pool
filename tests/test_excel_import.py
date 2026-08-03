@@ -2132,6 +2132,7 @@ class ExcelImportTests(unittest.TestCase):
                 self.assertEqual(claims_section.count('style="display:none"'), 85)
                 self.assertIn('data-progressive-step="20"', claims_section)
                 self.assertIn("显示更多", claims_section)
+                self.assertNotIn("当前查看范围", html)
         finally:
             self.app.actor_from_request = old_actor_from_request
             self.app.DB_PATH = old_db_path
@@ -2191,6 +2192,8 @@ class ExcelImportTests(unittest.TestCase):
             );
             """
         )
+        department = self.app.DEPARTMENTS[0]
+        other_department = self.app.DEPARTMENTS[1] if len(self.app.DEPARTMENTS) > 1 else "其他部门"
         conn.executemany(
             """
             INSERT INTO payments (id, received_date, payer_name, receiver_company, bank_note, amount_cents, claimed_department, status)
@@ -2201,10 +2204,9 @@ class ExcelImportTests(unittest.TestCase):
                 (2, "2026-06-25", "年会客户A", "蒲公英智库", "测试摘要2", 20000, "年会事业部", "claimed"),
                 (3, "2026-06-25", "混合客户", "蒲公英教育科技", "测试摘要3", 30000, "", "pending_confirm"),
                 (4, "2026-06-25", "关闭客户", "蒲公英教育科技", "测试摘要4", 99900, "", "closed"),
+                (5, "2026-05-31", "跨月客户", "蒲公英智库", "上月末到账", 4000, department, "claimed"),
             ],
         )
-        department = self.app.DEPARTMENTS[0]
-        other_department = self.app.DEPARTMENTS[1] if len(self.app.DEPARTMENTS) > 1 else "其他部门"
         conn.executemany(
             """
             INSERT INTO claims
@@ -2217,6 +2219,7 @@ class ExcelImportTests(unittest.TestCase):
                 (3, 3, other_department, "创新中心", "user-c", "王五", "项目C", 18000, "pending"),
                 (4, 4, department, "会议中心", "user-a", "张三", "项目D", 99900, "accepted"),
                 (5, 3, department, "项目主理", "user-b", "李四", "退款项目", -3000, "pending"),
+                (6, 5, department, "会议中心", "user-b", "李四", "上月项目", 4000, "accepted"),
             ],
         )
         today = date(2026, 6, 25)
@@ -2272,6 +2275,56 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual(user_all_dashboard["total_cents"], 50000)
         self.assertIn((department, 32000), user_all_dashboard["departments"])
         self.assertIn((other_department, 18000), user_all_dashboard["departments"])
+
+        cross_month_dashboard = self.app.personal_dashboard_data(
+            conn,
+            {"id": "user-b", "role": "claimant", "department": department},
+            custom_start=date(2026, 5, 31),
+            custom_end=date(2026, 6, 25),
+        )
+        self.assertEqual(len(cross_month_dashboard), 1)
+        self.assertEqual(cross_month_dashboard[0]["label"], "筛选区间")
+        self.assertEqual(cross_month_dashboard[0]["start"], date(2026, 5, 31))
+        self.assertEqual(cross_month_dashboard[0]["end"], date(2026, 6, 25))
+        self.assertEqual(cross_month_dashboard[0]["total_cents"], 36000)
+        self.assertIn(("跨月客户", 4000), cross_month_dashboard[0]["customers"])
+
+        filter_html = self.app.render_dashboard_date_filter("primary", "2026-05-01", "2026-05-31")
+        self.assertIn('name="start_date" value="2026-05-01"', filter_html)
+        self.assertIn('name="end_date" value="2026-05-31"', filter_html)
+        self.assertIn("恢复默认", filter_html)
+        scope_html = self.app.render_dashboard_scope_selector(
+            [{"key": "primary", "label": "主身份"}],
+            "primary",
+            start_date="2026-05-01",
+            end_date="2026-05-31",
+        )
+        self.assertIn('name="start_date" value="2026-05-01"', scope_html)
+        self.assertIn('name="end_date" value="2026-05-31"', scope_html)
+        self.assertFalse(
+            self.app.dashboard_scope_selector_visible(
+                [
+                    {"key": "all", "label": "全部角色"},
+                    {"key": "primary", "label": "主身份"},
+                ]
+            )
+        )
+        self.assertTrue(
+            self.app.dashboard_scope_selector_visible(
+                [
+                    {"key": "all", "label": "全部角色"},
+                    {"key": "primary", "label": "主身份"},
+                    {"key": "extra:1", "label": "年会报名组"},
+                ]
+            )
+        )
+
+        self.assertEqual(
+            self.app.dashboard_custom_range("2026-05-31", "2026-06-01"),
+            (date(2026, 5, 31), date(2026, 6, 1)),
+        )
+        with self.assertRaises(self.app.HTTPException):
+            self.app.dashboard_custom_range("2026-06-02", "2026-06-01")
 
     def test_today_claim_plain_text_groups_payer_and_appends_unclaimed_payers(self) -> None:
         conn = sqlite3.connect(":memory:")

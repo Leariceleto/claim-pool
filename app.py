@@ -1023,6 +1023,9 @@ BASE_CSS = """
     button:hover { background:var(--primary-dark); }
     button.secondary { background:#fff; color:var(--text); border:1px solid var(--line-strong); }
     button.secondary:hover { background:#f4f6fa; }
+    .secondary-link { display:inline-block; padding:8px 14px; border:1px solid var(--line-strong);
+      border-radius:8px; background:#fff; color:var(--text); font-weight:500; white-space:nowrap; }
+    .secondary-link:hover { background:#f4f6fa; text-decoration:none; }
     button.danger { background:#c2362b; }
     button.success { background:#16a34a; }
     button.success:hover { background:#15803d; }
@@ -1114,6 +1117,15 @@ BASE_CSS = """
     .admin-actions .edit-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .admin-actions .edit-row > div { width:auto !important; min-width:0; }
     .dash-grid { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:20px; }
+    .dash-toolbar { display:flex; align-items:flex-end; justify-content:space-between; gap:16px;
+      flex-wrap:wrap; margin-bottom:12px; }
+    .dash-toolbar h2 { margin-bottom:6px; }
+    .dash-toolbar .hint { margin:0; }
+    .dash-date-filter { display:flex; align-items:flex-end; justify-content:flex-end; gap:8px;
+      flex-wrap:wrap; margin-left:auto; }
+    .dash-date-filter .date-field { min-width:150px; }
+    .dash-date-filter .date-actions { display:flex; align-items:center; gap:8px; }
+    .identity-card > div:nth-child(2) { min-width:0; }
     .dash-panel { margin-bottom:0; padding:16px; }
     .dash-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:14px; }
     .dash-amount { font-size:20px; font-weight:650; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -1164,6 +1176,12 @@ BASE_CSS = """
       .dash-table td:nth-child(4)::before { content:"所属部门："; }
       .dash-table td:last-child { grid-column:2; grid-row:1; padding:0; text-align:right; }
       .dash-claim-details { color:var(--muted); }
+      .dash-date-filter { width:100%; display:grid; grid-template-columns:1fr 1fr; margin-left:0; }
+      .dash-date-filter .date-field { min-width:0; }
+      .dash-date-filter .date-actions { grid-column:1 / -1; }
+      .identity-card { display:grid !important; grid-template-columns:56px minmax(0,1fr);
+        align-items:center !important; }
+      .identity-card .identity-note { grid-column:1 / -1; max-width:none !important; text-align:left !important; }
     }
 """
 
@@ -3457,9 +3475,16 @@ def personal_dashboard_data(
     conn: sqlite3.Connection,
     actor: dict[str, str],
     today: Optional[date] = None,
+    custom_start: Optional[date] = None,
+    custom_end: Optional[date] = None,
 ) -> list[dict[str, Any]]:
     result = []
-    for label, start, end in dashboard_period_ranges(today):
+    periods = (
+        [("筛选区间", custom_start, custom_end)]
+        if custom_start is not None and custom_end is not None
+        else dashboard_period_ranges(today)
+    )
+    for label, start, end in periods:
         entries = dashboard_entries(conn, actor, start, end)
         result.append(
             {
@@ -3470,6 +3495,25 @@ def personal_dashboard_data(
             }
         )
     return result
+
+
+def dashboard_custom_range(start_text: str = "", end_text: str = "") -> Optional[tuple[date, date]]:
+    start_text = (start_text or "").strip()
+    end_text = (end_text or "").strip()
+    if not start_text and not end_text:
+        return None
+    if not start_text:
+        start_text = end_text
+    if not end_text:
+        end_text = start_text
+    try:
+        start = date.fromisoformat(start_text)
+        end = date.fromisoformat(end_text)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="看板日期格式不正确")
+    if end < start:
+        raise HTTPException(status_code=400, detail="结束日期不能早于开始日期")
+    return start, end
 
 
 def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
@@ -3527,6 +3571,8 @@ def render_dashboard_scope_selector(
     choices: list[dict[str, Any]],
     selected_key: str,
     show: bool = True,
+    start_date: str = "",
+    end_date: str = "",
 ) -> str:
     if not show:
         return ""
@@ -3534,8 +3580,15 @@ def render_dashboard_scope_selector(
         f'<option value="{esc(choice["key"])}"{" selected" if choice["key"] == selected_key else ""}>{esc(choice["label"])}</option>'
         for choice in choices
     )
+    date_inputs = ""
+    if start_date and end_date:
+        date_inputs = (
+            f'<input type="hidden" name="start_date" value="{esc(start_date)}">'
+            f'<input type="hidden" name="end_date" value="{esc(end_date)}">'
+        )
     return f"""
     <form method="get" action="/me" class="row" style="align-items:end; margin:-2px 0 14px">
+      {date_inputs}
       <div style="min-width:220px">
         <label>当前查看范围</label>
         <select name="scope" onchange="this.form.submit()">{options}</select>
@@ -3545,10 +3598,35 @@ def render_dashboard_scope_selector(
     """
 
 
+def dashboard_scope_selector_visible(choices: list[dict[str, Any]]) -> bool:
+    # choices[0] 是“全部角色”；至少还要有两个实际范围，切换才有意义。
+    return len(choices) > 2
+
+
+def render_dashboard_date_filter(selected_scope: str, start_date: str = "", end_date: str = "") -> str:
+    today_text = date.today().isoformat()
+    start_value = start_date or today_text
+    end_value = end_date or today_text
+    reset_action = (
+        f'<a class="secondary-link" href="{esc(url("/me", scope=selected_scope))}">恢复默认</a>'
+        if start_date and end_date
+        else ""
+    )
+    return f"""
+    <form method="get" action="/me" class="dash-date-filter">
+      <input type="hidden" name="scope" value="{esc(selected_scope)}">
+      <div class="date-field"><label>开始日期</label><input type="date" name="start_date" value="{esc(start_value)}" required></div>
+      <div class="date-field"><label>结束日期</label><input type="date" name="end_date" value="{esc(end_value)}" required></div>
+      <div class="date-actions"><button class="secondary" type="submit">查询</button>{reset_action}</div>
+    </form>
+    """
+
+
 def render_personal_dashboard(
     actor: dict[str, str],
     dashboard: list[dict[str, Any]],
     scope_selector: str = "",
+    date_filter: str = "",
 ) -> str:
     cards = []
     for item in dashboard:
@@ -3570,8 +3648,13 @@ def render_personal_dashboard(
             """
         )
     return f"""
-    <h2>数据看板</h2>
-    <p class="hint" style="margin:-4px 0 12px">当前范围：{esc(dashboard_scope_label(actor))}</p>
+    <div class="dash-toolbar">
+      <div>
+        <h2>数据看板</h2>
+        <p class="hint">当前范围：{esc(dashboard_scope_label(actor))}</p>
+      </div>
+      {date_filter}
+    </div>
     {scope_selector}
     <div class="dash-grid">{''.join(cards)}</div>
     """
@@ -3627,12 +3710,23 @@ def diagnostic_log_html(actor: dict[str, str], cur_dept: str, cur_team: str) -> 
 
 
 @app.get("/me", response_class=HTMLResponse)
-def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
+def personal_center(
+    request: Request,
+    scope: str = "all",
+    start_date: str = "",
+    end_date: str = "",
+) -> HTMLResponse:
     actor = actor_from_request(request)
+    custom_range = dashboard_custom_range(start_date, end_date)
+    selected_start = custom_range[0].isoformat() if custom_range else ""
+    selected_end = custom_range[1].isoformat() if custom_range else ""
     with get_conn() as conn:
         extra_scopes = get_user_scopes(conn, actor["id"]) if actor.get("authed") else []
         scope_choices = dashboard_scope_choices(actor, extra_scopes)
         selected_scope = next((choice for choice in scope_choices if choice["key"] == scope), scope_choices[0])
+        show_scope_selector = dashboard_scope_selector_visible(scope_choices)
+        if not show_scope_selector and len(scope_choices) > 1:
+            selected_scope = scope_choices[1]
         dashboard_actor = {
             **actor,
             "dashboard_scopes": selected_scope["scopes"],
@@ -3641,7 +3735,12 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
         if actor["role"] in {"finance", "admin", "superadmin"}:
             dashboard_actor = actor
             selected_scope = scope_choices[0]
-        dashboard = personal_dashboard_data(conn, dashboard_actor)
+        dashboard = personal_dashboard_data(
+            conn,
+            dashboard_actor,
+            custom_start=custom_range[0] if custom_range else None,
+            custom_end=custom_range[1] if custom_range else None,
+        )
         my_claims = conn.execute(
             """
             SELECT c.id AS c_id, c.department AS c_dept, c.team AS c_team,
@@ -3670,7 +3769,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
     )
     dept_display = f"{esc(cur_dept)} · {esc(cur_team)}" if cur_dept else "未设置部门"
     identity_card = f"""
-    <div class="panel" style="display:flex; gap:18px; align-items:center">
+    <div class="panel identity-card" style="display:flex; gap:18px; align-items:center">
       <div style="width:56px; height:56px; border-radius:14px; flex:none;
         background:linear-gradient(135deg,#2456d6,#4f7df7); color:#fff;
         display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:600">{initial}</div>
@@ -3680,7 +3779,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
           {dept_display} · {esc(role_label)}
         </div>
       </div>
-      <div class="muted" style="text-align:right; font-size:12px; max-width:230px">{id_note}</div>
+      <div class="muted identity-note" style="text-align:right; font-size:12px; max-width:230px">{id_note}</div>
     </div>
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
       <div class="stat" style="--dot:#16a34a"><span class="stat-label">已认领</span><strong>{accepted}</strong></div>
@@ -3693,8 +3792,11 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
     scope_selector = render_dashboard_scope_selector(
         scope_choices,
         selected_scope["key"],
-        show=actor["role"] not in {"finance", "admin", "superadmin"},
+        show=show_scope_selector and actor["role"] not in {"finance", "admin", "superadmin"},
+        start_date=selected_start,
+        end_date=selected_end,
     )
+    date_filter = render_dashboard_date_filter(selected_scope["key"], selected_start, selected_end)
 
     if my_claims:
         rows = []
@@ -3759,7 +3861,7 @@ def personal_center(request: Request, scope: str = "all") -> HTMLResponse:
     body = f"""
     {identity_card}
     {profile_modal}
-    {render_personal_dashboard(dashboard_actor, dashboard, scope_selector)}
+    {render_personal_dashboard(dashboard_actor, dashboard, scope_selector, date_filter)}
     <h2>我的认领</h2>
     {claims_html}
     {diagnostic_log_html(actor, cur_dept, cur_team)}
