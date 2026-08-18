@@ -339,7 +339,10 @@ class ExcelImportTests(unittest.TestCase):
         self.assertEqual([(row["id"], row["status"]) for row in statuses], [(1, "pending"), (2, "pending"), (3, "pending")])
         self.assertEqual(batch["status"], "confirmed")
         self.assertEqual(sent[0][0], "oc_test_chat")
-        self.assertIn("共 2 笔，合计 ¥ 465.67", sent[0][1])
+        self.assertIn("共 2 笔", sent[0][1])
+        self.assertNotIn("合计", sent[0][1])
+        self.assertNotIn("¥", sent[0][1])
+        self.assertNotIn("465.67", sent[0][1])
         self.assertEqual(audit_row["action"], "confirm_batch")
         self.assertTrue(json.loads(audit_row["detail_json"])["notified"])
 

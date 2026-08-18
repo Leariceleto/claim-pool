@@ -459,11 +459,11 @@ def row_value(row: Any, key: str, default: Any = "") -> Any:
     return default
 
 
-def build_batch_confirm_message(count: int, total_cents: int) -> str:
+def build_batch_confirm_message(count: int) -> str:
     return "\n".join(
         [
             "【今日到款已入池】",
-            f"财务已确认一批到款流水入池，共 {count} 笔，合计 ¥ {money(total_cents)}。",
+            f"财务已确认一批到款流水入池，共 {count} 笔。",
             "请相关同事进入财务到款认领系统查看并认领。",
         ]
     )
@@ -5272,7 +5272,7 @@ def confirm_import_batch(
 
     notified = False
     if rows:
-        notified = feishu_send_chat_text(FEISHU_NOTIFY_CHAT_ID, build_batch_confirm_message(len(rows), total_cents))
+        notified = feishu_send_chat_text(FEISHU_NOTIFY_CHAT_ID, build_batch_confirm_message(len(rows)))
 
     detail = {
         "batch_id": batch_id,
