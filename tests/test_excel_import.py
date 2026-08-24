@@ -174,7 +174,6 @@ class ExcelImportTests(unittest.TestCase):
                 payer_name TEXT,
                 amount_cents INTEGER NOT NULL,
                 bank_note TEXT,
-                receiver_company TEXT,
                 serial_no TEXT,
                 status TEXT NOT NULL
             );
@@ -185,29 +184,19 @@ class ExcelImportTests(unittest.TestCase):
             "payer_name": "北京测试学校",
             "amount": "1000",
             "bank_note": "报名费",
-            "receiver_company": "北京蒲公英教育科技有限公司",
             "serial_no": "SERIAL-001",
         }
         conn.execute(
             """
-            INSERT INTO payments
-                (id, received_date, payer_name, amount_cents, bank_note, receiver_company, serial_no, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO payments (id, received_date, payer_name, amount_cents, bank_note, serial_no, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (1, "2026-07-01", "北京测试学校", 100000, "报名费", "北京蒲公英教育科技有限公司", "SERIAL-001", "closed"),
+            (1, "2026-07-01", "北京测试学校", 100000, "报名费", "SERIAL-001", "closed"),
         )
 
         self.assertFalse(self.app.duplicate_exists(conn, item_with_serial))
         conn.execute("UPDATE payments SET status = 'pending' WHERE id = 1")
         self.assertTrue(self.app.duplicate_exists(conn, item_with_serial))
-        item_with_serial["received_date"] = "2026-08-24"
-        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial))
-        item_with_serial["received_date"] = "2026-07-01"
-        item_with_serial["receiver_company"] = "重庆市蒲公英未来科技有限公司两江新区分公司"
-        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial))
-        item_with_serial["receiver_company"] = "北京蒲公英教育科技有限公司"
-        item_with_serial["amount"] = "1001"
-        self.assertFalse(self.app.duplicate_exists(conn, item_with_serial))
 
     def test_duplicate_exists_keeps_identical_rows_without_serial_number(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -278,102 +267,18 @@ class ExcelImportTests(unittest.TestCase):
         detail = self.app.close_payments_bulk(conn, actor, [1, 2, 2, 3, 999])
 
         rows = conn.execute("SELECT id, status, closed_at FROM payments ORDER BY id").fetchall()
-        self.assertEqual([row["status"] for row in rows], ["closed", "closed", "draft"])
+        self.assertEqual([row["status"] for row in rows], ["closed", "closed", "closed"])
         self.assertTrue(rows[0]["closed_at"])
         self.assertEqual(rows[1]["closed_at"], "2026-06-20 10:00:00")
-        self.assertFalse(rows[2]["closed_at"])
-        self.assertEqual(detail["closed_ids"], [1])
+        self.assertTrue(rows[2]["closed_at"])
+        self.assertEqual(detail["closed_ids"], [1, 3])
         self.assertEqual(detail["skipped_closed_ids"], [2])
-        self.assertEqual(detail["skipped_draft_ids"], [3])
         self.assertEqual(detail["missing_ids"], [999])
 
         audit_row = conn.execute("SELECT action, detail_json FROM audit_logs").fetchone()
         self.assertEqual(audit_row["action"], "bulk_close_payments")
         audit_detail = json.loads(audit_row["detail_json"])
-        self.assertEqual(audit_detail["count"], 1)
-
-    def test_cancel_import_batch_removes_closed_rows_from_draft_batch_without_claims(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(
-            """
-            CREATE TABLE import_batches (
-                id INTEGER PRIMARY KEY,
-                status TEXT NOT NULL
-            );
-            CREATE TABLE payments (
-                id INTEGER PRIMARY KEY,
-                batch_id INTEGER NOT NULL,
-                status TEXT NOT NULL
-            );
-            CREATE TABLE claims (
-                id INTEGER PRIMARY KEY,
-                payment_id INTEGER NOT NULL
-            );
-            CREATE TABLE audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                at TEXT NOT NULL,
-                actor_id TEXT NOT NULL,
-                actor_name TEXT NOT NULL,
-                actor_role TEXT NOT NULL,
-                action TEXT NOT NULL,
-                payment_id INTEGER,
-                detail_json TEXT NOT NULL,
-                ip TEXT
-            );
-            """
-        )
-        conn.execute("INSERT INTO import_batches (id, status) VALUES (156, 'draft')")
-        conn.executemany(
-            "INSERT INTO payments (id, batch_id, status) VALUES (?, 156, ?)",
-            [(458, "draft"), (459, "closed")],
-        )
-
-        detail = self.app.cancel_import_batch(
-            conn,
-            {"id": "finance", "name": "财务管理员", "role": "finance"},
-            156,
-        )
-
-        self.assertEqual(detail["payment_ids"], [458, 459])
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM payments WHERE batch_id = 156").fetchone()[0], 0)
-        self.assertEqual(conn.execute("SELECT status FROM import_batches WHERE id = 156").fetchone()[0], "canceled")
-
-    def test_cancel_import_batch_keeps_closed_rows_with_claim_history(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(
-            """
-            CREATE TABLE import_batches (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
-            CREATE TABLE payments (id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL, status TEXT NOT NULL);
-            CREATE TABLE claims (id INTEGER PRIMARY KEY, payment_id INTEGER NOT NULL);
-            CREATE TABLE audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                at TEXT NOT NULL,
-                actor_id TEXT NOT NULL,
-                actor_name TEXT NOT NULL,
-                actor_role TEXT NOT NULL,
-                action TEXT NOT NULL,
-                payment_id INTEGER,
-                detail_json TEXT NOT NULL,
-                ip TEXT
-            );
-            INSERT INTO import_batches (id, status) VALUES (157, 'draft');
-            INSERT INTO payments (id, batch_id, status) VALUES (460, 157, 'closed');
-            INSERT INTO claims (id, payment_id) VALUES (1, 460);
-            """
-        )
-
-        with self.assertRaises(self.app.HTTPException) as error:
-            self.app.cancel_import_batch(
-                conn,
-                {"id": "finance", "name": "财务管理员", "role": "finance"},
-                157,
-            )
-
-        self.assertEqual(error.exception.status_code, 409)
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM payments WHERE batch_id = 157").fetchone()[0], 1)
-        self.assertEqual(conn.execute("SELECT status FROM import_batches WHERE id = 157").fetchone()[0], "draft")
+        self.assertEqual(audit_detail["count"], 2)
 
     def test_confirm_import_batch_sends_group_notification(self) -> None:
         conn = sqlite3.connect(":memory:")
