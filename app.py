@@ -1728,10 +1728,45 @@ def duplicate_exists(conn: sqlite3.Connection, item: dict[str, str]) -> bool:
     # POS 汇总流水可能同日、同额且摘要相同，无流水号时不自动判重。
     if not serial_no:
         return False
-    row = conn.execute(
-        "SELECT id FROM payments WHERE serial_no = ? AND status != 'closed' LIMIT 1",
-        (serial_no,),
-    ).fetchone()
+    received_date = parse_date(item.get("received_date"))
+    receiver_company = item.get("receiver_company", "").strip()
+    amount_cents = parse_amount(item.get("amount"))
+    payer_name = item.get("payer_name", "").strip()
+    bank_note = item.get("bank_note", "").strip()
+    if received_date and receiver_company:
+        row = conn.execute(
+            """
+            SELECT id FROM payments
+            WHERE serial_no = ?
+              AND received_date = ?
+              AND COALESCE(receiver_company, '') = ?
+              AND amount_cents = ?
+              AND COALESCE(payer_name, '') = ?
+              AND COALESCE(bank_note, '') = ?
+              AND status != 'closed'
+            LIMIT 1
+            """,
+            (serial_no, received_date, receiver_company, amount_cents, payer_name, bank_note),
+        ).fetchone()
+    elif received_date:
+        row = conn.execute(
+            """
+            SELECT id FROM payments
+            WHERE serial_no = ?
+              AND received_date = ?
+              AND amount_cents = ?
+              AND COALESCE(payer_name, '') = ?
+              AND COALESCE(bank_note, '') = ?
+              AND status != 'closed'
+            LIMIT 1
+            """,
+            (serial_no, received_date, amount_cents, payer_name, bank_note),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM payments WHERE serial_no = ? AND status != 'closed' LIMIT 1",
+            (serial_no,),
+        ).fetchone()
     return row is not None
 
 
@@ -5075,8 +5110,27 @@ def render_admin_payment_row(
           </div>
         </details>
         """
+    resolve_ui = ""
+    if row["status"] != "draft":
+        resolve_ui = f"""
+        <details class="fold">
+          <summary>处理状态</summary>
+          <div class="fold-body">
+            <form method="post" action="/admin/payments/{row['id']}/resolve">
+              {finance_hidden(actor)}
+              <div class="field"><label>状态</label><select name="status">
+                {status_options(row['status'])}
+              </select></div>
+              <div class="field"><label>分配部门</label>{department_select("department", row["claimed_department"], class_name="cs-dept")}</div>
+              <div class="field"><label>中心 / 小组</label>{team_select("team", row["claimed_department"] or "", row["claimed_team"] or "")}</div>
+              <div class="field"><label>管理备注</label><input name="finance_note" value="{esc(row['finance_note'])}"></div>
+              <button type="submit">更新状态</button>
+            </form>
+          </div>
+        </details>
+        """
     select_cell = (
-        f'<td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row["id"]}" aria-label="选择流水 #{row["id"]}" {"disabled" if row["status"] == "closed" else ""}></td>'
+        f'<td class="select-cell col-select"><input class="bulk-payment-checkbox" form="bulk-close-form" type="checkbox" name="payment_ids" value="{row["id"]}" aria-label="选择流水 #{row["id"]}" {"disabled" if row["status"] in {"closed", "draft"} else ""}></td>'
         if selectable
         else '<td class="select-cell col-select"></td>'
     )
@@ -5111,21 +5165,7 @@ def render_admin_payment_row(
             </form>
           </div>
         </details>
-        <details class="fold">
-          <summary>处理状态</summary>
-          <div class="fold-body">
-            <form method="post" action="/admin/payments/{row['id']}/resolve">
-              {finance_hidden(actor)}
-              <div class="field"><label>状态</label><select name="status">
-                {status_options(row['status'])}
-              </select></div>
-              <div class="field"><label>分配部门</label>{department_select("department", row["claimed_department"], class_name="cs-dept")}</div>
-              <div class="field"><label>中心 / 小组</label>{team_select("team", row["claimed_department"] or "", row["claimed_team"] or "")}</div>
-              <div class="field"><label>管理备注</label><input name="finance_note" value="{esc(row['finance_note'])}"></div>
-              <button type="submit">更新状态</button>
-            </form>
-          </div>
-        </details>
+        {resolve_ui}
         {reject_ui}
       </td>
     </tr>
@@ -5283,30 +5323,48 @@ def confirm_import_batch(
     return detail
 
 
+def cancel_import_batch(
+    conn: sqlite3.Connection,
+    actor: dict[str, str],
+    batch_id: int,
+    request: Optional[Request] = None,
+) -> dict[str, Any]:
+    batch = conn.execute("SELECT * FROM import_batches WHERE id = ?", (batch_id,)).fetchone()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    if batch["status"] != "draft":
+        raise HTTPException(status_code=409, detail="只有待确认批次可以取消")
+    rows = conn.execute(
+        """
+        SELECT p.id, p.status,
+               EXISTS(SELECT 1 FROM claims c WHERE c.payment_id = p.id) AS has_claims
+        FROM payments p
+        WHERE p.batch_id = ?
+        ORDER BY p.id
+        """,
+        (batch_id,),
+    ).fetchall()
+    locked = [row for row in rows if row["status"] not in {"draft", "closed"} or row["has_claims"]]
+    if locked:
+        raise HTTPException(status_code=409, detail="该批次已有已入池或已认领流水，不能取消")
+    payment_ids = [row["id"] for row in rows]
+    conn.execute("DELETE FROM payments WHERE batch_id = ?", (batch_id,))
+    conn.execute("UPDATE import_batches SET status = 'canceled' WHERE id = ?", (batch_id,))
+    detail = {"batch_id": batch_id, "count": len(rows), "payment_ids": payment_ids}
+    audit(conn, actor, "cancel_batch", None, detail, request)
+    return detail
+
+
 @app.post("/admin/batches/{batch_id}/cancel")
 def cancel_batch(
     request: Request,
     batch_id: int,
 ) -> RedirectResponse:
-    # 敏感操作：仅允许取消尚未确认入池的 draft 批次，避免误删已开放认领的数据
+    # 敏感操作：仅允许取消尚未确认入池、且没有认领记录的批次。
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
-        batch = conn.execute("SELECT * FROM import_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not batch:
-            raise HTTPException(status_code=404, detail="批次不存在")
-        if batch["status"] != "draft":
-            raise HTTPException(status_code=409, detail="只有待确认批次可以取消")
-        locked = conn.execute(
-            "SELECT COUNT(*) AS count FROM payments WHERE batch_id = ? AND status != 'draft'",
-            (batch_id,),
-        ).fetchone()["count"]
-        if locked:
-            raise HTTPException(status_code=409, detail="该批次已有非待确认流水，不能取消")
-        rows = conn.execute("SELECT id FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,)).fetchall()
-        conn.execute("DELETE FROM payments WHERE batch_id = ? AND status = 'draft'", (batch_id,))
-        conn.execute("UPDATE import_batches SET status = 'canceled' WHERE id = ?", (batch_id,))
-        audit(conn, actor, "cancel_batch", None, {"batch_id": batch_id, "count": len(rows)}, request)
+        cancel_import_batch(conn, actor, batch_id, request)
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -5336,12 +5394,17 @@ def close_payments_bulk(
     close_ids = [
         payment_id
         for payment_id in unique_ids
-        if payment_id in status_by_id and status_by_id[payment_id] != "closed"
+        if payment_id in status_by_id and status_by_id[payment_id] not in {"closed", "draft"}
     ]
     skipped_closed = [
         payment_id
         for payment_id in unique_ids
         if status_by_id.get(payment_id) == "closed"
+    ]
+    skipped_draft = [
+        payment_id
+        for payment_id in unique_ids
+        if status_by_id.get(payment_id) == "draft"
     ]
     missing_ids = [payment_id for payment_id in unique_ids if payment_id not in found_ids]
     closed_at = now_text()
@@ -5363,9 +5426,10 @@ def close_payments_bulk(
         "requested_ids": unique_ids,
         "closed_ids": close_ids,
         "skipped_closed_ids": skipped_closed,
+        "skipped_draft_ids": skipped_draft,
         "missing_ids": missing_ids,
         "count": len(close_ids),
-        "skipped": len(skipped_closed) + len(missing_ids),
+        "skipped": len(skipped_closed) + len(skipped_draft) + len(missing_ids),
     }
     audit(conn, actor, "bulk_close_payments", None, detail, request)
     return detail
@@ -5828,6 +5892,11 @@ def resolve_payment(
     if status == "claimed" and not department:
         raise HTTPException(status_code=400, detail="标记已认领时必须选择部门")
     with get_conn() as conn:
+        current = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="到款记录不存在")
+        if current["status"] == "draft":
+            raise HTTPException(status_code=409, detail="待确认流水请通过导入批次确认或取消")
         if team:
             row = conn.execute(
                 "SELECT claimed_department FROM payments WHERE id = ?", (payment_id,)
