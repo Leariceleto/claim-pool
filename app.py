@@ -9,12 +9,14 @@ import os
 import re
 import secrets
 import sqlite3
+import logging
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from datetime import date, datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -111,6 +113,13 @@ FEISHU_TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_acces
 FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
 FEISHU_SEND_CHAT_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
 FEISHU_NOTIFY_CHAT_ID = os.environ.get("FEISHU_NOTIFY_CHAT_ID", "").strip()
+UNCLAIMED_REMINDER_RECIPIENTS = {
+    "董芳": os.environ.get("FEISHU_REMINDER_DONGFANG_OPEN_ID", "").strip(),
+    "何玲": os.environ.get("FEISHU_REMINDER_HELING_OPEN_ID", "").strip(),
+}
+REMINDER_TIMEZONE = timezone(timedelta(hours=8))
+REMINDER_STOP = threading.Event()
+REMINDER_THREAD: Optional[threading.Thread] = None
 # 应用对外根地址（用于消息里的查看链接），从回调地址推导
 APP_BASE_URL = os.environ.get("APP_BASE_URL") or FEISHU_REDIRECT_URI.replace("/oauth/callback", "")
 
@@ -377,11 +386,20 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(received_date);
             CREATE INDEX IF NOT EXISTS idx_claims_payment ON claims(payment_id);
             CREATE INDEX IF NOT EXISTS idx_audit_payment ON audit_logs(payment_id);
+
+            CREATE TABLE IF NOT EXISTS payment_reminders (
+                payment_id INTEGER PRIMARY KEY,
+                message TEXT NOT NULL,
+                recipients_json TEXT NOT NULL,
+                sent_json TEXT NOT NULL DEFAULT '[]'
+            );
             """
         )
         ensure_column(conn, "payments", "claimed_team", "claimed_team TEXT")
         ensure_column(conn, "payments", "closed_at", "closed_at TEXT")
         ensure_column(conn, "payments", "receiver_company", "receiver_company TEXT")
+        ensure_column(conn, "payments", "reminder_due_at", "reminder_due_at TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_reminder_due ON payments(reminder_due_at)")
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "app_users", "managed_role", "managed_role TEXT NOT NULL DEFAULT 'claimant'")
@@ -427,6 +445,79 @@ def repair_compact_payment_dates(conn: sqlite3.Connection) -> int:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    global REMINDER_THREAD
+    if all(UNCLAIMED_REMINDER_RECIPIENTS.values()) and not (REMINDER_THREAD and REMINDER_THREAD.is_alive()):
+        REMINDER_STOP.clear()
+        REMINDER_THREAD = threading.Thread(target=reminder_loop, daemon=True)
+        REMINDER_THREAD.start()
+
+
+@app.on_event("shutdown")
+def stop_reminders() -> None:
+    REMINDER_STOP.set()
+
+
+def next_day_reminder_at() -> str:
+    tomorrow = datetime.now(REMINDER_TIMEZONE).date() + timedelta(days=1)
+    return f"{tomorrow.isoformat()} 17:00:00"
+
+
+def process_payment_reminders(current_time: Optional[str] = None) -> None:
+    recipients = list(dict.fromkeys(UNCLAIMED_REMINDER_RECIPIENTS.values()))
+    if not all(UNCLAIMED_REMINDER_RECIPIENTS.values()) or len(recipients) != 2:
+        return
+    current_time = current_time or datetime.now(REMINDER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        # 串行生成快照，避免多 worker 为同一流水重复创建通知。
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM payments WHERE reminder_due_at <= ?", (current_time,)
+        ).fetchall()
+        for payment in rows:
+            if payment["status"] in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
+                claimed = claim_totals(conn, payment["id"])["active"]
+                remaining = max(payment["amount_cents"] - claimed, 0)
+                if remaining:
+                    message = "\n".join([
+                        "【到款未认领完提醒】",
+                        f"流水 ID：#{payment['id']}",
+                        f"上传时间：{payment['imported_at']}",
+                        f"付款方：{payment['payer_name'] or '未填写'}",
+                        f"到款公司：{payment['receiver_company'] or '未填写'}",
+                        f"到款总额：¥ {money(payment['amount_cents'])}",
+                        f"已认领金额：¥ {money(claimed)}",
+                        f"剩余未认领金额：¥ {money(remaining)}",
+                        f"统计时间：{current_time}（北京时间）",
+                        "请进入财务到款认领系统查看并跟进。",
+                    ])
+                    conn.execute(
+                        "INSERT OR IGNORE INTO payment_reminders (payment_id, message, recipients_json) VALUES (?, ?, ?)",
+                        (payment["id"], message, json.dumps(recipients)),
+                    )
+            conn.execute("UPDATE payments SET reminder_due_at = NULL WHERE id = ?", (payment["id"],))
+    with get_conn() as conn:
+        reminders = conn.execute("SELECT payment_id FROM payment_reminders WHERE sent_json != recipients_json").fetchall()
+    for reminder in reminders:
+        for recipient in recipients:
+            with get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (reminder["payment_id"],)).fetchone()
+                sent = json.loads(row["sent_json"])
+                if recipient in sent or recipient not in json.loads(row["recipients_json"]):
+                    continue
+                if feishu_send_text(recipient, row["message"]):
+                    sent.append(recipient)
+                    sent = [item for item in json.loads(row["recipients_json"]) if item in sent]
+                    conn.execute("UPDATE payment_reminders SET sent_json = ? WHERE payment_id = ?", (json.dumps(sent), row["payment_id"]))
+
+
+def reminder_loop() -> None:
+    while not REMINDER_STOP.is_set():
+        try:
+            process_payment_reminders()
+        except Exception:
+            logging.exception("到款未认领提醒任务失败，将在下一轮重试")
+        REMINDER_STOP.wait(60)
 
 
 def esc(value: Any) -> str:
@@ -5203,8 +5294,8 @@ def admin_import(
                 """
                 INSERT INTO payments
                     (batch_id, imported_at, received_date, received_time, payer_name, amount_cents,
-                     bank_note, receiver_company, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                     bank_note, receiver_company, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json, reminder_due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -5221,6 +5312,7 @@ def admin_import(
                     confidence,
                     f"字段缺失：{', '.join(missing)}" if missing else "",
                     json.dumps(item, ensure_ascii=False),
+                    next_day_reminder_at(),
                 ),
             )
             imported += 1
