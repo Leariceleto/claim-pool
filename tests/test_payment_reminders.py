@@ -90,6 +90,18 @@ class PaymentReminderTests(unittest.TestCase):
         self.assertEqual(send.call_count, 2)
         self.assertIn("已认领金额：¥ 50.00", send.call_args.args[1])
 
+    def test_dashboard_filters_only_apply_to_admin_roles(self):
+        from starlette.requests import Request
+
+        request = Request({"type": "http", "method": "GET", "path": "/me", "query_string": b"", "headers": [], "scheme": "http", "server": ("localhost", 8002)})
+        for role in ["claimant", "general_manager", "admin", "superadmin"]:
+            actor = dict(id="test-user", name="测试", role=role, department="年会", team="", authed="1")
+            with patch.object(self.app, "actor_from_request", return_value=actor), patch.object(self.app, "personal_dashboard_data", return_value=[]) as dashboard:
+                self.app.personal_center(request, dashboard_department="年会", filter_payer="南京")
+            expected = "年会" if role in {"admin", "superadmin"} else ""
+            self.assertEqual(dashboard.call_args.kwargs["department"], expected)
+            self.assertEqual(dashboard.call_args.kwargs["filters"].get("filter_payer", ""), "南京" if expected else "")
+
 
 if __name__ == "__main__":
     unittest.main()

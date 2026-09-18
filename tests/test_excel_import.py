@@ -88,6 +88,47 @@ class ExcelImportTests(unittest.TestCase):
 
     def test_parse_date_supports_compact_yyyymmdd(self) -> None:
         self.assertEqual(self.app.parse_date("20260707"), "2026-07-07")
+
+    def test_dashboard_department_filter_before_limit_and_total(self) -> None:
+        from unittest.mock import patch
+
+        entries = [
+            {"payment_id": 707, "payer_name": "付款方", "department": "其他部门", "amount_cents": 10000}
+            for _ in range(60)
+        ] + [
+            {"payment_id": 707, "payer_name": "付款方", "department": "年会", "amount_cents": 3000},
+            {"payment_id": 708, "payer_name": "退款", "department": "年会", "amount_cents": -500},
+        ]
+        with patch.object(self.app, "dashboard_entries", return_value=entries):
+            result = self.app.personal_dashboard_data(None, {"role": "admin"}, department="年会")
+            empty = self.app.personal_dashboard_data(None, {"role": "admin"}, department="未认领")
+        for period in result:
+            self.assertEqual(period["total_cents"], 2500)
+            self.assertEqual(len(period["rows"]), 2)
+            self.assertEqual(period["rows"][0]["payment_id"], 707)
+        self.assertTrue(all(period["total_cents"] == 0 and not period["rows"] for period in empty))
+
+    def test_dashboard_column_filters_combine(self) -> None:
+        entries = [dict(payment_id=707, payer_name="南京学校", receiver_company="未来科技", bank_note="年会退款", amount_cents=-500),
+                   dict(payment_id=708, payer_name="南京学校", receiver_company="未来科技", bank_note="年会退款", amount_cents=500)]
+        filters = dict(filter_payer="南京", filter_receiver="科技", filter_summary="退款")
+        self.assertEqual(self.app.filter_dashboard_entries(entries, filters), entries)
+        filters["filter_receiver"] = "不存在"
+        self.assertEqual(self.app.filter_dashboard_entries(entries, filters), [])
+
+    def test_dashboard_removed_filters_are_ignored(self) -> None:
+        entries = [dict(payment_id=707, amount_cents=100)]
+        self.assertEqual(self.app.filter_dashboard_entries(entries, dict(filter_id="708", filter_min="1000")), entries)
+
+    def test_dashboard_empty_table_keeps_filter_controls_and_escapes_values(self) -> None:
+        rendered = self.app.render_dashboard_rows([], {"filter_payer": '\"><script>alert(1)</script>'}, ["年会"], {"scope": "all", "start_date": "2026-09-01", "end_date": "2026-09-18"})
+        for key in ["filter_payer", "filter_receiver", "filter_summary", "dashboard_department"]:
+            self.assertIn(f'name="{key}"', rendered)
+        for key in ["filter_id", "filter_min", "filter_max"]:
+            self.assertNotIn(f'name="{key}"', rendered)
+        self.assertIn("暂无匹配款项", rendered)
+        self.assertIn("清除筛选", rendered)
+        self.assertNotIn("<script>", rendered)
         self.assertEqual(self.app.parse_date("2026-07-07"), "2026-07-07")
 
     def test_ooxml_workbook_with_xls_suffix_imports(self) -> None:

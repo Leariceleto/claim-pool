@@ -1225,6 +1225,18 @@ BASE_CSS = """
     .dash-table-wrap::-webkit-scrollbar-thumb { background:#c7ceda; border-radius:999px; }
     .dash-table-wrap::-webkit-scrollbar-thumb:hover { background:#aeb8c8; }
     .dash-table { width:100%; table-layout:fixed; }
+    .dash-column-filter .dash-table-wrap { overflow-x:auto; max-height:360px; }
+    .dash-column-filter .dash-table { min-width:0; }
+    .dash-column-heading { display:flex; align-items:center; gap:4px; }
+    .dash-column-heading > span { flex:none; white-space:nowrap; }
+    .dash-table th:last-child .dash-column-heading { justify-content:flex-end; }
+    .dash-column-controls:empty { display:none; }
+    .dash-column-controls { display:flex; align-items:center; gap:3px; min-width:0; flex:1; max-width:88px; }
+    .dash-column-filter th input, .dash-column-filter th select { display:block; width:100%; min-width:0; margin:0; padding:5px 4px; font-size:11px; }
+    .dash-column-filter th:first-child .dash-column-controls { max-width:44px; }
+    .dash-column-filter th:last-child .dash-column-controls { max-width:120px; }
+    @media (max-width:760px) { .dash-column-filter .dash-table { min-width:760px; } }
+    .dash-column-filter .date-actions { margin-top:10px; display:flex; align-items:center; gap:12px; }
     .dash-table th { position:sticky; top:0; z-index:1; padding:8px 10px 8px 0; background:#fff;
       border-bottom:1px solid var(--line); font-size:11.5px; }
     .dash-table td { padding:8px 10px 8px 0; font-size:12.5px; }
@@ -3394,6 +3406,7 @@ def dashboard_entries(
             payment = grouped.setdefault(
                 row["id"],
                 {
+                    "payment_id": row["id"],
                     "payer_name": row["payer_name"] or "未填写付款方",
                     "bank_note": row["bank_note"] or "",
                     "receiver_company": row["receiver_company"] or "",
@@ -3424,6 +3437,7 @@ def dashboard_entries(
                 entries.append(
                     {
                         "payer_name": payment["payer_name"],
+                        "payment_id": payment["payment_id"],
                         "bank_note": payment["bank_note"],
                         "receiver_company": payment["receiver_company"],
                         "department": claim["department"] or "未认领",
@@ -3440,6 +3454,7 @@ def dashboard_entries(
                 entries.append(
                     {
                         "payer_name": payment["payer_name"],
+                        "payment_id": payment["payment_id"],
                         "bank_note": payment["bank_note"],
                         "receiver_company": payment["receiver_company"],
                         "department": department or "未认领",
@@ -3485,7 +3500,7 @@ def dashboard_entries(
 
     rows = conn.execute(
         f"""
-        SELECT p.payer_name, p.bank_note, p.receiver_company, c.department, c.team,
+        SELECT p.id AS payment_id, p.payer_name, p.bank_note, p.receiver_company, c.department, c.team,
                c.customer_project, c.actor_name, c.amount_cents
         FROM claims c
         JOIN payments p ON p.id = c.payment_id
@@ -3499,6 +3514,7 @@ def dashboard_entries(
     ).fetchall()
     return [
         {
+            "payment_id": row["payment_id"],
             "payer_name": row["payer_name"] or "未填写付款方",
             "bank_note": row["bank_note"] or "",
             "receiver_company": row["receiver_company"] or "",
@@ -3536,6 +3552,7 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
         rows.append(
             {
                 "payer_name": payer_name,
+                "payment_id": entry.get("payment_id"),
                 "bank_note": bank_note,
                 "receiver_company": receiver_company,
                 "department": department,
@@ -3567,6 +3584,8 @@ def personal_dashboard_data(
     today: Optional[date] = None,
     custom_start: Optional[date] = None,
     custom_end: Optional[date] = None,
+    department: str = "",
+    filters: Optional[dict[str, str]] = None,
 ) -> list[dict[str, Any]]:
     result = []
     periods = (
@@ -3576,6 +3595,9 @@ def personal_dashboard_data(
     )
     for label, start, end in periods:
         entries = dashboard_entries(conn, actor, start, end)
+        if department:
+            entries = [entry for entry in entries if entry["department"] == department]
+        entries = filter_dashboard_entries(entries, filters or {})
         result.append(
             {
                 "label": label,
@@ -3606,8 +3628,22 @@ def dashboard_custom_range(start_text: str = "", end_text: str = "") -> Optional
     return start, end
 
 
-def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
-    if not rows:
+def filter_dashboard_entries(entries: list[dict[str, Any]], filters: dict[str, str]) -> list[dict[str, Any]]:
+    result = []
+    for entry in entries:
+        if any(filters.get(key, "").strip().casefold() not in str(entry.get(field) or "").casefold()
+               for key, field in (("filter_payer", "payer_name"), ("filter_receiver", "receiver_company"), ("filter_summary", "bank_note"))):
+            continue
+        result.append(entry)
+    return result
+
+
+def dashboard_hidden_filters(filters: Optional[dict[str, str]]) -> str:
+    return "".join(f'<input type="hidden" name="{esc(key)}" value="{esc(value)}">' for key, value in (filters or {}).items())
+
+
+def render_dashboard_rows(rows: list[dict[str, Any]], filters: Optional[dict[str, str]] = None, departments: Optional[list[str]] = None, context: Optional[dict[str, str]] = None) -> str:
+    if not rows and filters is None:
         return '<div class="dash-table-wrap"><div class="muted" style="padding:12px 0">暂无款项数据</div></div>'
     def claim_details(row: dict[str, Any]) -> str:
         if not row.get("is_claim"):
@@ -3631,6 +3667,7 @@ def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
     body = "".join(
         f"""
         <tr>
+          <td class="nowrap">{('#' + esc(row['payment_id'])) if row.get('payment_id') is not None else ''}</td>
           <td>{esc(row["payer_name"])}</td>
           <td>{esc(receiver_company_label(row.get("receiver_company")))}</td>
           <td>{esc(row.get("bank_note") or "")}{claim_details(row)}</td>
@@ -3640,21 +3677,37 @@ def render_dashboard_rows(rows: list[dict[str, Any]]) -> str:
         """
         for row in rows
     )
-    return f"""
+    headers = ["ID", "付款客户", "到款公司", "摘要", "款项所属部门", "金额"]
+    controls = [""] * 6
+    if filters is not None:
+        def field(key: str, label: str) -> str:
+            return f'<input name="{key}" value="{esc(filters.get(key, ""))}" aria-label="{label}" placeholder="{label}">'
+        options = '<option value="">全部部门</option>' + "".join(
+            f'<option value="{esc(item)}"{" selected" if item == filters.get("dashboard_department") else ""}>{esc(item)}</option>' for item in (departments or [])
+        )
+        controls = ["", field("filter_payer", "客户关键词"), field("filter_receiver", "公司关键词"), field("filter_summary", "摘要关键词"),
+                    f'<select name="dashboard_department" aria-label="款项所属部门">{options}</select>',
+                    ""]
+    table = f"""
     <div class="dash-table-wrap">
       <table class="dash-table">
         <colgroup>
-          <col style="width:28%">
+          <col style="width:8%">
           <col style="width:20%">
-          <col style="width:26%">
-          <col style="width:14%">
+          <col style="width:19%">
+          <col style="width:19%">
+          <col style="width:22%">
           <col style="width:12%">
         </colgroup>
-        <thead><tr><th>付款客户</th><th>到款公司</th><th>摘要</th><th>款项所属部门</th><th>金额</th></tr></thead>
-        <tbody>{body}</tbody>
+        <thead><tr>{''.join(f'<th><div class="dash-column-heading"><span>{label}</span><div class="dash-column-controls">{control}</div></div></th>' for label, control in zip(headers, controls))}</tr></thead>
+        <tbody>{body or '<tr><td colspan="6" class="muted">暂无匹配款项</td></tr>'}</tbody>
       </table>
     </div>
     """
+    if filters is None:
+        return table
+    reset_url = url("/me", **(context or {}))
+    return f'<form method="get" action="/me" class="dash-column-filter">{dashboard_hidden_filters(context)}{table}<div class="date-actions"><button type="submit" class="secondary">筛选</button> <a class="secondary-link" href="{esc(reset_url)}">清除筛选</a></div></form>'
 
 
 def render_dashboard_scope_selector(
@@ -3663,6 +3716,8 @@ def render_dashboard_scope_selector(
     show: bool = True,
     start_date: str = "",
     end_date: str = "",
+    department: str = "",
+    filters: Optional[dict[str, str]] = None,
 ) -> str:
     if not show:
         return ""
@@ -3679,6 +3734,8 @@ def render_dashboard_scope_selector(
     return f"""
     <form method="get" action="/me" class="row" style="align-items:end; margin:-2px 0 14px">
       {date_inputs}
+      {dashboard_hidden_filters(filters)}
+      <input type="hidden" name="dashboard_department" value="{esc(department)}">
       <div style="min-width:220px">
         <label>当前查看范围</label>
         <select name="scope" onchange="this.form.submit()">{options}</select>
@@ -3693,18 +3750,20 @@ def dashboard_scope_selector_visible(choices: list[dict[str, Any]]) -> bool:
     return len(choices) > 2
 
 
-def render_dashboard_date_filter(selected_scope: str, start_date: str = "", end_date: str = "") -> str:
+def render_dashboard_date_filter(selected_scope: str, start_date: str = "", end_date: str = "", department: str = "", departments: Optional[list[str]] = None, filters: Optional[dict[str, str]] = None) -> str:
     today_text = date.today().isoformat()
     start_value = start_date or today_text
     end_value = end_date or today_text
     reset_action = (
         f'<a class="secondary-link" href="{esc(url("/me", scope=selected_scope))}">恢复默认</a>'
-        if start_date and end_date
+        if (start_date and end_date) or department
         else ""
     )
     return f"""
     <form method="get" action="/me" class="dash-date-filter">
       <input type="hidden" name="scope" value="{esc(selected_scope)}">
+      <input type="hidden" name="dashboard_department" value="{esc(department)}">
+      {dashboard_hidden_filters(filters)}
       <div class="date-field"><label>开始日期</label><input type="date" name="start_date" value="{esc(start_value)}" required></div>
       <div class="date-field"><label>结束日期</label><input type="date" name="end_date" value="{esc(end_value)}" required></div>
       <div class="date-actions"><button class="secondary" type="submit">查询</button>{reset_action}</div>
@@ -3717,6 +3776,9 @@ def render_personal_dashboard(
     dashboard: list[dict[str, Any]],
     scope_selector: str = "",
     date_filter: str = "",
+    filters: Optional[dict[str, str]] = None,
+    departments: Optional[list[str]] = None,
+    context: Optional[dict[str, str]] = None,
 ) -> str:
     cards = []
     for item in dashboard:
@@ -3733,7 +3795,7 @@ def render_personal_dashboard(
                 </div>
                 <div class="dash-amount">¥ {money(item["total_cents"])}</div>
               </div>
-              {render_dashboard_rows(item["rows"])}
+              {render_dashboard_rows(item["rows"], filters, departments, context)}
             </div>
             """
         )
@@ -3805,8 +3867,16 @@ def personal_center(
     scope: str = "all",
     start_date: str = "",
     end_date: str = "",
+    dashboard_department: str = "",
+    filter_payer: str = "",
+    filter_receiver: str = "",
+    filter_summary: str = "",
 ) -> HTMLResponse:
     actor = actor_from_request(request)
+    can_filter = bool(actor.get("authed")) and actor["role"] in {"admin", "finance", "superadmin"}
+    column_filters = dict(filter_payer=filter_payer, filter_receiver=filter_receiver, filter_summary=filter_summary) if can_filter else {}
+    if not can_filter:
+        dashboard_department = ""
     custom_range = dashboard_custom_range(start_date, end_date)
     selected_start = custom_range[0].isoformat() if custom_range else ""
     selected_end = custom_range[1].isoformat() if custom_range else ""
@@ -3825,15 +3895,27 @@ def personal_center(
         if actor["role"] in {"finance", "admin", "superadmin"}:
             dashboard_actor = actor
             selected_scope = scope_choices[0]
+        if actor["role"] in {"finance", "admin", "superadmin"}:
+            filter_departments = [*DEPARTMENTS, "未认领"]
+        else:
+            filter_departments = list(dict.fromkeys(
+                item["department"] for item in selected_scope["scopes"]
+                if item.get("department") in DEPARTMENTS
+            ))
+        dashboard_department = dashboard_department.strip()
+        if dashboard_department and dashboard_department not in filter_departments:
+            raise HTTPException(status_code=400, detail="请选择当前查看范围内的部门")
         dashboard = personal_dashboard_data(
             conn,
             dashboard_actor,
             custom_start=custom_range[0] if custom_range else None,
             custom_end=custom_range[1] if custom_range else None,
+            department=dashboard_department,
+            filters=column_filters,
         )
         my_claims = conn.execute(
             """
-            SELECT c.id AS c_id, c.department AS c_dept, c.team AS c_team,
+            SELECT c.id AS c_id, p.id AS payment_id, c.department AS c_dept, c.team AS c_team,
                    c.customer_project AS c_proj, c.amount_cents AS c_amount,
                    c.created_at AS c_at, c.status AS c_status,
                    p.received_date, p.payer_name, p.receiver_company, p.bank_note, p.status AS p_status,
@@ -3885,8 +3967,12 @@ def personal_center(
         show=show_scope_selector and actor["role"] not in {"finance", "admin", "superadmin"},
         start_date=selected_start,
         end_date=selected_end,
+        department=dashboard_department,
+        filters=column_filters,
     )
-    date_filter = render_dashboard_date_filter(selected_scope["key"], selected_start, selected_end)
+    date_filter = render_dashboard_date_filter(selected_scope["key"], selected_start, selected_end, dashboard_department, filter_departments, column_filters)
+    filter_context = dict(scope=selected_scope["key"], start_date=selected_start, end_date=selected_end)
+    table_filters = {**column_filters, "dashboard_department": dashboard_department} if can_filter else None
 
     if my_claims:
         rows = []
@@ -3917,6 +4003,7 @@ def personal_center(
             rows.append(
                 f"""
                 <tr data-progressive-group="my-claims"{row_style}>
+                  <td class="nowrap">#{esc(r["payment_id"])}</td>
                   <td class="nowrap">{esc(r["received_date"])}</td>
                   <td>
                     <strong>{esc(r["payer_name"])}</strong>
@@ -3939,7 +4026,7 @@ def personal_center(
         claims_html = f"""
         <div class="table-wrap">
         <table>
-          <thead><tr><th>到款日期</th><th>付款方 / 到款公司 / 备注</th><th>部门 / 中心 / 项目</th><th>提交时间</th><th>当前状态</th></tr></thead>
+          <thead><tr><th>ID</th><th>到款日期</th><th>付款方 / 到款公司 / 备注</th><th>部门 / 中心 / 项目</th><th>提交时间</th><th>当前状态</th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
         </table>
         {more_button}
@@ -3951,7 +4038,7 @@ def personal_center(
     body = f"""
     {identity_card}
     {profile_modal}
-    {render_personal_dashboard(dashboard_actor, dashboard, scope_selector, date_filter)}
+    {render_personal_dashboard(dashboard_actor, dashboard, scope_selector, date_filter, table_filters, filter_departments, filter_context)}
     <h2>我的认领</h2>
     {claims_html}
     {diagnostic_log_html(actor, cur_dept, cur_team)}
