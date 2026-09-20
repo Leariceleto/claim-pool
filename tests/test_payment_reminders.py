@@ -37,14 +37,17 @@ class PaymentReminderTests(unittest.TestCase):
 
     def test_partial_claim_reports_both_amounts_and_only_sends_once(self):
         self.payment(claimed=3000, status="partial_claiming")
-        with patch.object(self.app, "feishu_send_text", return_value=True) as send:
+        with patch.object(self.app, "deliver_notification", return_value="") as send:
             self.app.process_payment_reminders("2026-09-17 16:59:59")
+            self.app.process_notification_outbox(1000)
             send.assert_not_called()
             self.app.process_payment_reminders("2026-09-17 17:00:00")
+            self.app.process_notification_outbox(1000)
             self.app.process_payment_reminders("2026-09-18 17:00:00")
+            self.app.process_notification_outbox(2000)
         self.assertEqual(send.call_count, 2)
-        self.assertEqual({call.args[0] for call in send.call_args_list}, {"ou_d", "ou_h"})
-        message = send.call_args.args[1]
+        self.assertEqual({call.args[0]["recipient_id"] for call in send.call_args_list}, {"ou_d", "ou_h"})
+        message = send.call_args.args[0]["message"]
         self.assertIn("已认领金额：¥ 30.00", message)
         self.assertIn("剩余未认领金额：¥ 70.00", message)
 
@@ -53,8 +56,9 @@ class PaymentReminderTests(unittest.TestCase):
         self.payment(status="closed")
         self.payment(status="draft")
         self.payment(due=None)
-        with patch.object(self.app, "feishu_send_text") as send:
+        with patch.object(self.app, "deliver_notification") as send:
             self.app.process_payment_reminders("2026-09-17 17:00:00")
+            self.app.process_notification_outbox(1000)
         send.assert_not_called()
 
     def test_schedule_uses_next_calendar_day_at_17_beijing_time(self):
@@ -65,13 +69,16 @@ class PaymentReminderTests(unittest.TestCase):
 
     def test_retry_only_failed_recipient_with_original_snapshot(self):
         self.payment()
-        with patch.object(self.app, "feishu_send_text", side_effect=[True, False, True]) as send:
+        with patch.object(self.app, "deliver_notification", side_effect=["", "test_failure", ""]) as send:
             self.app.process_payment_reminders("2026-09-17 17:00:00")
+            self.app.process_notification_outbox(1000)
             self.app.process_payment_reminders("2026-09-17 17:01:00")
+            self.app.process_notification_outbox(1060)
             self.app.process_payment_reminders("2026-09-17 17:02:00")
-        self.assertEqual([call.args[0] for call in send.call_args_list], ["ou_d", "ou_h", "ou_h"])
-        self.assertEqual(send.call_args_list[1].args[1], send.call_args_list[2].args[1])
-        self.assertIn("已认领金额：¥ 0.00", send.call_args.args[1])
+            self.app.process_notification_outbox(1120)
+        self.assertEqual([call.args[0]["recipient_id"] for call in send.call_args_list], ["ou_d", "ou_h", "ou_h"])
+        self.assertEqual(send.call_args_list[1].args[0]["message"], send.call_args_list[2].args[0]["message"])
+        self.assertIn("已认领金额：¥ 0.00", send.call_args.args[0]["message"])
 
     def test_missing_recipient_leaves_schedule_pending(self):
         self.payment()
@@ -85,10 +92,11 @@ class PaymentReminderTests(unittest.TestCase):
         pid = self.payment(claimed=7000, status="partial_claiming")
         with self.app.get_conn() as conn:
             conn.execute("INSERT INTO claims (payment_id, department, actor_id, actor_name, status, created_at, amount_cents) VALUES (?, '部门', 'u', '同事', 'accepted', '2026-09-17 12:00:00', -2000)", (pid,))
-        with patch.object(self.app, "feishu_send_text", return_value=True) as send:
+        with patch.object(self.app, "deliver_notification", return_value="") as send:
             self.app.process_payment_reminders("2026-09-18 10:00:00")
+            self.app.process_notification_outbox(1000)
         self.assertEqual(send.call_count, 2)
-        self.assertIn("已认领金额：¥ 50.00", send.call_args.args[1])
+        self.assertIn("已认领金额：¥ 50.00", send.call_args.args[0]["message"])
 
     def test_dashboard_filters_only_apply_to_admin_roles(self):
         from starlette.requests import Request

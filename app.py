@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from contextlib import closing
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -23,7 +24,10 @@ from typing import Any, Optional, Union
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -80,7 +84,7 @@ FEISHU_SUPERADMIN_OPEN_IDS = {
     if x.strip()
 }
 # 给会话 cookie 签名用，必须保密；未设置则随机生成（重启后旧会话失效）
-SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_hex(32)).encode()
+SESSION_SECRET = (os.environ.get("SESSION_SECRET", "").strip() or secrets.token_hex(32)).encode()
 SESSION_COOKIE = "claim_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 天
 
@@ -181,7 +185,16 @@ app = FastAPI(title="飞书到款认领系统 MVP")
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    public_paths = {"/", "/login", "/oauth/callback", "/logout"}
+    if request.url.path not in public_paths and not read_session(request.cookies.get(SESSION_COOKIE, "")):
+        if request.method in {"GET", "HEAD"} and request.headers.get("x-requested-with") != "fetch":
+            response = RedirectResponse(url("/login", next=request.url.path + ("?" + request.url.query if request.url.query else "")), status_code=303)
+        else:
+            response = Response(content='{"detail":"请先用飞书登录"}', status_code=401, media_type="application/json")
+    else:
+        response = await call_next(request)
+    if request.method == "POST" and request.headers.get("x-requested-with") == "fetch" and response.status_code == 303:
+        response = Response(json.dumps({"redirect": response.headers["location"], "message": "操作已完成。"}, ensure_ascii=False), media_type="application/json")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "same-origin")
@@ -203,6 +216,24 @@ async def security_headers(request: Request, call_next):
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.exception_handler(StarletteHTTPException)
+@app.exception_handler(RequestValidationError)
+async def readable_request_error(request: Request, exc: Exception) -> Response:
+    validation = isinstance(exc, RequestValidationError)
+    status = 422 if validation else exc.status_code
+    if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+        message = "请检查查询条件的格式。" if validation else str(exc.detail)
+        title = {403: "暂无访问权限", 404: "页面不存在", 400: "请检查查询条件", 422: "请检查查询条件"}.get(status, "请求未完成")
+        response = page(title, f'<div class="callout warn" role="alert">{esc(message)}</div>'
+                        '<div class="row"><button type="button" class="secondary" onclick="history.back()">返回上一页</button>'
+                        '<a class="secondary-link" href="/me">返回个人中心</a></div>')
+        response.status_code = status
+        return response
+    if validation:
+        return await request_validation_exception_handler(request, exc)
+    return await http_exception_handler(request, exc)
 
 
 def client_ip(request: Request) -> str:
@@ -233,6 +264,27 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def begin_write(conn: sqlite3.Connection) -> None:
+    # 调用者负责提交/回滚；必须在余额和状态读取之前取得写事务。
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
+def validate_claim_net(amount_cents: int, active_cents: int) -> None:
+    if active_cents < 0 or active_cents > amount_cents:
+        raise HTTPException(status_code=409, detail="操作后认领净额必须在 0 和到款金额之间；请关联修正退款分摊或退回整笔认领")
+
+
+def parse_form_amount(value: str) -> int:
+    text = value.strip()
+    if len(text) > 32 or not re.fullmatch(r"-?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?", text):
+        raise HTTPException(status_code=400, detail="金额格式不正确，请填写数字，最多保留两位小数")
+    cents = int(Decimal(text.replace(",", "")) * 100)
+    if abs(cents) > 9223372036854775807:
+        raise HTTPException(status_code=400, detail="金额超出允许范围")
+    return cents
 
 
 def refresh_catalog(conn: Optional[sqlite3.Connection] = None) -> None:
@@ -393,12 +445,32 @@ def init_db() -> None:
                 recipients_json TEXT NOT NULL,
                 sent_json TEXT NOT NULL DEFAULT '[]'
             );
+
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL,
+                recipient_type TEXT NOT NULL,
+                recipient_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                request_uuid TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL DEFAULT 0,
+                lease_until REAL NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                UNIQUE(event_key, recipient_type, recipient_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox(status, available_at, lease_until);
             """
         )
         ensure_column(conn, "payments", "claimed_team", "claimed_team TEXT")
         ensure_column(conn, "payments", "closed_at", "closed_at TEXT")
         ensure_column(conn, "payments", "receiver_company", "receiver_company TEXT")
         ensure_column(conn, "payments", "reminder_due_at", "reminder_due_at TEXT")
+        ensure_column(conn, "notification_outbox", "last_attempt_at", "last_attempt_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_reminder_due ON payments(reminder_due_at)")
         ensure_column(conn, "claims", "team", "team TEXT")
         ensure_column(conn, "claims", "amount_cents", "amount_cents INTEGER NOT NULL DEFAULT 0")
@@ -446,7 +518,7 @@ def repair_compact_payment_dates(conn: sqlite3.Connection) -> int:
 def startup() -> None:
     init_db()
     global REMINDER_THREAD
-    if all(UNCLAIMED_REMINDER_RECIPIENTS.values()) and not (REMINDER_THREAD and REMINDER_THREAD.is_alive()):
+    if not (REMINDER_THREAD and REMINDER_THREAD.is_alive()):
         REMINDER_STOP.clear()
         REMINDER_THREAD = threading.Thread(target=reminder_loop, daemon=True)
         REMINDER_THREAD.start()
@@ -464,16 +536,17 @@ def next_day_reminder_at() -> str:
 
 def process_payment_reminders(current_time: Optional[str] = None) -> None:
     recipients = list(dict.fromkeys(UNCLAIMED_REMINDER_RECIPIENTS.values()))
-    if not all(UNCLAIMED_REMINDER_RECIPIENTS.values()) or len(recipients) != 2:
-        return
+    configured = all(UNCLAIMED_REMINDER_RECIPIENTS.values()) and len(recipients) == 2
     current_time = current_time or datetime.now(REMINDER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    with get_conn() as conn:
+    with closing(get_conn()) as conn, conn:
         # 串行生成快照，避免多 worker 为同一流水重复创建通知。
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT * FROM payments WHERE reminder_due_at <= ?", (current_time,)
-        ).fetchall()
+        ).fetchall() if configured else []
         for payment in rows:
+            if payment["status"] == "draft":
+                continue
             if payment["status"] in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
                 claimed = claim_totals(conn, payment["id"])["active"]
                 remaining = max(payment["amount_cents"] - claimed, 0)
@@ -495,20 +568,85 @@ def process_payment_reminders(current_time: Optional[str] = None) -> None:
                         (payment["id"], message, json.dumps(recipients)),
                     )
             conn.execute("UPDATE payments SET reminder_due_at = NULL WHERE id = ?", (payment["id"],))
-    with get_conn() as conn:
+    with closing(get_conn()) as conn:
         reminders = conn.execute("SELECT payment_id FROM payment_reminders WHERE sent_json != recipients_json").fetchall()
     for reminder in reminders:
-        for recipient in recipients:
-            with get_conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (reminder["payment_id"],)).fetchone()
-                sent = json.loads(row["sent_json"])
-                if recipient in sent or recipient not in json.loads(row["recipients_json"]):
-                    continue
-                if feishu_send_text(recipient, row["message"]):
-                    sent.append(recipient)
-                    sent = [item for item in json.loads(row["recipients_json"]) if item in sent]
-                    conn.execute("UPDATE payment_reminders SET sent_json = ? WHERE payment_id = ?", (json.dumps(sent), row["payment_id"]))
+        with closing(get_conn()) as conn, conn:
+            begin_write(conn)
+            row = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (reminder["payment_id"],)).fetchone()
+            for recipient in json.loads(row["recipients_json"]):
+                if recipient not in json.loads(row["sent_json"]):
+                    enqueue_notification(conn, f"reminder:{row['payment_id']}", recipient, row["message"])
+
+
+def enqueue_notification(conn: sqlite3.Connection, event_key: str, recipient: str, message: str, recipient_type: str = "open_id") -> bool:
+    if not recipient:
+        return False
+    conn.execute(
+        """INSERT OR IGNORE INTO notification_outbox
+        (event_key, recipient_type, recipient_id, message, request_uuid, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)""",
+        (event_key, recipient_type, recipient, message, str(uuid.uuid4()), now_text()),
+    )
+    return True
+
+
+def deliver_notification(job: sqlite3.Row) -> str:
+    """返回空字符串表示成功；仅存错误类别/码，避免把令牌或消息正文写进错误日志。"""
+    if not feishu_enabled():
+        return "feishu_not_configured"
+    token = feishu_tenant_token()
+    if not token:
+        return "tenant_token_unavailable"
+    endpoint = FEISHU_SEND_CHAT_MSG_URL if job["recipient_type"] == "chat_id" else FEISHU_SEND_MSG_URL
+    resp = _feishu_request(endpoint, "POST", {
+        "receive_id": job["recipient_id"], "msg_type": "text",
+        "content": json.dumps({"text": job["message"]}, ensure_ascii=False),
+        "uuid": job["request_uuid"],
+    }, bearer=token)
+    if resp.get("code") == 0:
+        return ""
+    return f"send_failed: {resp.get('code', resp.get('error', 'unknown'))}"
+
+
+def process_notification_outbox(current_time: Optional[float] = None, limit: int = 50) -> None:
+    # 领取与结果落库各自使用短事务；飞书请求期间不持有数据库连接或写锁。
+    deadline = time.monotonic() + 20
+    for _ in range(limit):
+        if time.monotonic() >= deadline:
+            return
+        current = time.time() if current_time is None else current_time
+        token = str(uuid.uuid4())
+        with closing(get_conn()) as conn, conn:
+            begin_write(conn)
+            job = conn.execute("""SELECT * FROM notification_outbox
+                WHERE (status = 'pending' AND available_at <= ?)
+                   OR (status = 'sending' AND lease_until <= ?)
+                ORDER BY id LIMIT 1""", (current, current)).fetchone()
+            if not job:
+                return
+            conn.execute("""UPDATE notification_outbox SET status = 'sending', attempts = attempts + 1,
+                lease_token = ?, lease_until = ?, last_attempt_at = ? WHERE id = ?""", (token, current + 300, now_text(), job["id"]))
+        try:
+            error = deliver_notification(job)
+        except Exception as exc:
+            error = f"send_exception: {type(exc).__name__}"
+        finished = time.time() if current_time is None else current_time
+        with closing(get_conn()) as conn, conn:
+            begin_write(conn)
+            changed = conn.execute("""UPDATE notification_outbox
+                SET status = ?, sent_at = ?, last_error = ?, available_at = ?, lease_until = 0, lease_token = NULL
+                WHERE id = ? AND lease_token = ?""",
+                ("pending" if error else "sent", None if error else now_text(), error or None,
+                 finished + min(3600, 60 * 2 ** min(int(job["attempts"]), 6)) if error else 0,
+                 job["id"], token)).rowcount
+            if changed and not error and job["event_key"].startswith("reminder:"):
+                payment_id = int(job["event_key"].split(":")[1])
+                reminder = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (payment_id,)).fetchone()
+                if reminder:
+                    sent = set(json.loads(reminder["sent_json"])) | {job["recipient_id"]}
+                    ordered = [item for item in json.loads(reminder["recipients_json"]) if item in sent]
+                    conn.execute("UPDATE payment_reminders SET sent_json = ? WHERE payment_id = ?", (json.dumps(ordered), payment_id))
 
 
 def reminder_loop() -> None:
@@ -517,7 +655,11 @@ def reminder_loop() -> None:
             process_payment_reminders()
         except Exception:
             logging.exception("到款未认领提醒任务失败，将在下一轮重试")
-        REMINDER_STOP.wait(60)
+        try:
+            process_notification_outbox()
+        except Exception:
+            logging.exception("通知队列处理失败，将在下一轮重试")
+        REMINDER_STOP.wait(5)
 
 
 def esc(value: Any) -> str:
@@ -526,6 +668,12 @@ def esc(value: Any) -> str:
 
 def url(path: str, **params: str) -> str:
     return f"{path}?{urlencode(params)}"
+
+
+def action_redirect(request: Request, target: str, message: str) -> Response:
+    if request.headers.get("x-requested-with") == "fetch":
+        return Response(json.dumps({"redirect": target, "message": message}, ensure_ascii=False), media_type="application/json")
+    return RedirectResponse(target, status_code=303)
 
 
 def money(cents: Optional[int]) -> str:
@@ -652,14 +800,13 @@ def notify_admins_claim_canceled(
 ) -> dict[str, Any]:
     admin_open_ids = admin_notification_open_ids(conn)
     message = build_claim_cancel_admin_message(payment, claim, actor, payment_status)
-    sent_count = 0
     for open_id in admin_open_ids:
-        if feishu_send_text(open_id, message):
-            sent_count += 1
+        enqueue_notification(conn, f"cancel_claim:{claim['id']}", open_id, message)
     return {
         "admin_notify_count": len(admin_open_ids),
-        "admin_notified_count": sent_count,
-        "admin_notified": sent_count > 0,
+        "admin_queued_count": len(admin_open_ids),
+        "admin_notified_count": 0,
+        "admin_notified": False,
     }
 
 
@@ -987,15 +1134,13 @@ def actor_from_request(request: Request) -> dict[str, str]:
             "team": team,
             "authed": "1",
         }
-    # 无会话 = 未授权：身份字段仅供 demo 展示，role 一律强制为最低权限 claimant，
-    # 绝不从 query/header 读取角色，杜绝 ?role=admin / x-role 之类的越权。
-    params = request.query_params
+    # 匿名请求不接受任何 URL/header 身份字段。
     return {
-        "id": params.get("user") or request.headers.get("x-user-id") or "demo-user",
-        "name": params.get("name") or request.headers.get("x-user-name") or "演示用户",
+        "id": "",
+        "name": "未登录",
         "role": "claimant",
-        "department": params.get("department") or request.headers.get("x-department") or "未设置部门",
-        "team": params.get("team") or "",
+        "department": "未设置部门",
+        "team": "",
         "authed": "",
     }
 
@@ -1087,7 +1232,7 @@ BASE_CSS = """
 
     main { max-width:1180px; margin:0 auto; padding:28px 28px 64px; }
     .page-head { margin-bottom:20px; }
-    h1 { font-size:24px; margin:0; letter-spacing:-.01em; }
+    h1 { font-size:24px; margin:0; letter-spacing:0; }
     .page-sub { margin:4px 0 0; color:var(--muted); font-size:13px; }
     h2 { font-size:16px; margin:32px 0 12px; display:flex; align-items:center; gap:8px; }
     h2::before { content:""; width:4px; height:16px; border-radius:2px; background:var(--primary); }
@@ -1121,6 +1266,22 @@ BASE_CSS = """
     button.success:hover { background:#15803d; }
     button:disabled { opacity:.55; cursor:not-allowed; }
     button:disabled:hover { background:var(--primary); }
+    button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid var(--primary); outline-offset:3px; }
+    .form-feedback { width:100%; flex-basis:100%; padding:10px 12px; margin:0 0 12px;
+      border:1px solid #e8b8b3; border-radius:6px; background:#fff5f4; color:#9b2c22;
+      white-space:normal; overflow-wrap:anywhere; scroll-margin-top:160px; }
+    .form-feedback.pending { color:var(--muted); background:#f8fafc; border-color:var(--line); }
+    .form-feedback button, .form-feedback a { margin:8px 8px 0 0; }
+    form.has-feedback { flex-wrap:wrap; }
+    button.is-submitting::before { content:""; display:inline-block; width:12px; height:12px;
+      border:2px solid currentColor; border-right-color:transparent; border-radius:50%;
+      margin-right:6px; vertical-align:-2px; animation:submission-spin .8s linear infinite; }
+    @keyframes submission-spin { to { transform:rotate(360deg); } }
+    @media (prefers-reduced-motion:reduce) { button.is-submitting::before { animation:none; } }
+    .action-notice { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+    .action-notice[hidden] { display:none; }
+    .notice-dismiss { flex:none; width:28px; height:28px; padding:0; color:var(--muted); background:transparent; font-size:20px; }
+    .notice-dismiss:hover { background:#e4f2e9; }
 
     .table-wrap { background:var(--card); border:1px solid var(--line); border-radius:var(--radius);
       box-shadow:var(--shadow); margin-bottom:20px; overflow-x:auto; }
@@ -1161,7 +1322,7 @@ BASE_CSS = """
     .stat-label { font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:7px; }
     .stat-label::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--dot,#94a3b8); flex:none; }
     .stat strong { display:block; font-size:26px; font-weight:650; margin:8px 0 2px;
-      font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+      font-variant-numeric:tabular-nums; letter-spacing:0; }
     .stat-amount { font-size:12px; color:var(--faint); font-variant-numeric:tabular-nums; }
 
     .callout { background:#fff; border:1px solid var(--line); border-left:4px solid var(--faint);
@@ -1182,7 +1343,9 @@ BASE_CSS = """
     .split-form-cell { padding:0 16px 16px; background:#fff; }
     .split-form-cell details.fold { margin:0; }
     .split-form-cell details.fold .fold-body { padding:16px; }
-    .split-form-table { min-width:960px; }
+    .split-form-table { min-width:0; max-width:100%; }
+    .split-form-table table { min-width:960px; }
+    .split-net-total { font-weight:600; font-variant-numeric:tabular-nums; margin:12px 0; }
     .split-form-table th:last-child, .split-form-table td:last-child { min-width:260px; }
     .confirm-claim-form { margin-top:10px; }
     .confirm-claim-form button { width:100%; }
@@ -1206,7 +1369,8 @@ BASE_CSS = """
     .admin-actions button { width:100%; padding-left:10px; padding-right:10px; }
     .admin-actions .edit-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     .admin-actions .edit-row > div { width:auto !important; min-width:0; }
-    .dash-grid { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:20px; }
+    .dash-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:14px; margin-bottom:20px; }
+    .dash-panel, .dash-column-filter { min-width:0; }
     .dash-toolbar { display:flex; align-items:flex-end; justify-content:space-between; gap:16px;
       flex-wrap:wrap; margin-bottom:12px; }
     .dash-toolbar h2 { margin-bottom:6px; }
@@ -1257,10 +1421,14 @@ BASE_CSS = """
     .modal .hint { margin:0 0 18px; }
 
     @media (max-width: 760px) {
-      header { padding:10px 16px; }
+      header { padding:10px 16px; flex-wrap:wrap; gap:8px; }
+      .header-controls { flex-wrap:wrap; width:100%; min-width:0; gap:8px !important; }
+      nav { order:3; width:100%; overflow-x:auto; }
+      nav a { flex:none; white-space:nowrap; padding:7px 10px; }
       main { padding:20px 16px 48px; }
       .brand-text small { display:none; }
       .admin-stat-grid { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+      .catalog-panel .row > form, .catalog-panel form.row > div { min-width:0 !important; max-width:100%; flex:1 1 100% !important; }
       table { min-width:680px; }
       .dash-table-wrap { overflow-x:hidden; }
       .dash-table { display:block; min-width:0; }
@@ -1271,12 +1439,18 @@ BASE_CSS = """
       .dash-table tr:last-child { border-bottom:0; }
       .dash-table td { display:block; min-width:0; padding:0; border:0; }
       .dash-table td:first-child { grid-column:1; grid-row:1; font-weight:600; }
-      .dash-table td:nth-child(2), .dash-table td:nth-child(3), .dash-table td:nth-child(4) {
+      .dash-table td:nth-child(2), .dash-table td:nth-child(3), .dash-table td:nth-child(4), .dash-table td:nth-child(5) {
         grid-column:1 / -1; color:var(--muted); }
-      .dash-table td:nth-child(2)::before { content:"到款公司："; }
-      .dash-table td:nth-child(3)::before { content:"摘要："; }
-      .dash-table td:nth-child(4)::before { content:"所属部门："; }
+      .dash-table td[data-label]::before { content:attr(data-label) "："; }
       .dash-table td:last-child { grid-column:2; grid-row:1; padding:0; text-align:right; }
+      .dash-column-filter .dash-table { display:table; }
+      .dash-column-filter .dash-table colgroup { display:table-column-group; }
+      .dash-column-filter .dash-table thead { display:table-header-group; }
+      .dash-column-filter .dash-table tbody { display:table-row-group; }
+      .dash-column-filter .dash-table tr { display:table-row; }
+      .dash-column-filter .dash-table td { display:table-cell; padding:8px 10px 8px 0; }
+      .dash-column-filter .dash-table td:last-child { padding-right:18px; }
+      .dash-column-filter .dash-table td[data-label]::before { content:none; }
       .dash-claim-details { color:var(--muted); }
       .dash-date-filter { width:100%; display:grid; grid-template-columns:1fr 1fr; margin-left:0; }
       .dash-date-filter .date-field { min-width:0; }
@@ -1350,15 +1524,19 @@ def page(
       <span class="brand-mark">¥</span>
       <span class="brand-text"><strong>到款认领</strong><small>到款认领管理系统</small></span>
     </div>
-    <div style="display:flex; align-items:center; gap:18px">
+    <div class="header-controls" style="display:flex; align-items:center; gap:18px">
       <nav>{nav}</nav>
       <div class="user-area">{user_area}</div>
     </div>
   </header>
   <main>
+    <div id="action-notice" class="callout success action-notice" role="status" hidden>
+      <span></span><button type="button" class="notice-dismiss" aria-label="关闭提示" title="关闭提示">×</button>
+    </div>
     <div class="page-head"><h1>{esc(title)}</h1>{subtitle_html}</div>
     {body}
   </main>
+  <script>{FORM_INTERACTION_JS}</script>
 </body>
 </html>"""
     )
@@ -1984,6 +2162,122 @@ def view_attachment(request: Request, filename: str) -> FileResponse:
     return FileResponse(path, filename=filename)
 
 
+FORM_INTERACTION_JS = """
+(function () {
+  var notice = document.getElementById('action-notice');
+  try {
+    var saved = JSON.parse(sessionStorage.getItem('claim-action-notice') || 'null');
+    sessionStorage.removeItem('claim-action-notice');
+    if (notice && saved && saved.path === location.pathname && Date.now() - saved.at < 60000) {
+      notice.querySelector('span').textContent = saved.message;
+      notice.hidden = false;
+    }
+  } catch (_) {}
+  if (notice) notice.querySelector('button').addEventListener('click', function () { notice.hidden = true; });
+
+  document.addEventListener('submit', async function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement) || form.method.toLowerCase() !== 'post' || event.defaultPrevented) return;
+    var target = new URL(form.action, location.href);
+    if (target.origin !== location.origin) return;
+    event.preventDefault();
+    if (form.dataset.submitting) return;
+    var data = new FormData(form);
+    if (event.submitter && event.submitter.name) data.append(event.submitter.name, event.submitter.value);
+    var body = form.enctype === 'multipart/form-data' || form.querySelector('input[type=file]') ? data : new URLSearchParams(data);
+    var controls = Array.prototype.map.call(form.elements, function (element) {
+      return {element:element, disabled:element.disabled};
+    });
+    var button = event.submitter;
+    var oldWidth = button ? button.style.minWidth : '';
+    if (button) { button.style.minWidth = button.getBoundingClientRect().width + 'px'; button.classList.add('is-submitting'); }
+    controls.forEach(function (item) { item.element.disabled = true; });
+    form.dataset.submitting = '1';
+    form.setAttribute('aria-busy', 'true');
+    form.classList.add('has-feedback');
+    var feedback = form.querySelector(':scope > .form-feedback');
+    if (!feedback) {
+      feedback = document.createElement('div');
+      form.prepend(feedback);
+    }
+    feedback.className = 'form-feedback pending';
+    feedback.setAttribute('role', 'status');
+    feedback.textContent = form.querySelector('input[type=file]') ? '正在上传并处理，请稍候…' : '正在提交，请稍候…';
+    function unlock() {
+      controls.forEach(function (item) { item.element.disabled = item.disabled; });
+      delete form.dataset.submitting;
+      form.removeAttribute('aria-busy');
+      if (button) { button.style.minWidth = oldWidth; button.classList.remove('is-submitting'); }
+    }
+    function showError(message, uncertain) {
+      feedback.className = 'form-feedback';
+      feedback.setAttribute('role', 'alert');
+      feedback.textContent = message;
+      feedback.scrollIntoView({block:'nearest'});
+      if (!uncertain) { unlock(); return; }
+      form.removeAttribute('aria-busy');
+      if (button) button.classList.remove('is-submitting');
+      var refresh = document.createElement('button');
+      refresh.type = 'button';
+      refresh.className = 'secondary';
+      refresh.textContent = '刷新核对';
+      refresh.addEventListener('click', function () { location.reload(); });
+      feedback.appendChild(document.createElement('br'));
+      feedback.appendChild(refresh);
+    }
+    try {
+      var response = await fetch(target.href, {method:'POST', body:body, credentials:'same-origin',
+        headers:{'X-Requested-With':'fetch', 'Accept':'application/json'}});
+      var result = await response.json();
+      if (response.ok && result.redirect) {
+        var destination = new URL(result.redirect, location.href);
+        if (destination.origin !== location.origin) throw new Error('unexpected redirect');
+        try { sessionStorage.setItem('claim-action-notice', JSON.stringify({path:destination.pathname,
+          message:result.message || '操作已完成。', at:Date.now()})); } catch (_) {}
+        location.assign(destination.href);
+        return;
+      }
+      if (response.status >= 400 && response.status < 500) {
+        showError(typeof result.detail === 'string' ? result.detail : '请检查必填项和输入格式。', false);
+        if (response.status === 401) {
+          var login = document.createElement('a');
+          login.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+          login.target = '_blank'; login.rel = 'noopener'; login.textContent = '在新窗口登录';
+          feedback.appendChild(document.createElement('br')); feedback.appendChild(login);
+        }
+        return;
+      }
+      throw new Error('unconfirmed response');
+    } catch (_) {
+      showError('暂时无法确认提交结果。请先刷新核对，避免重复提交；当前填写内容仍保留在页面中。', true);
+    }
+  });
+  window.addEventListener('pageshow', function (event) {
+    if (event.persisted && document.querySelector('form[data-submitting]')) location.reload();
+  });
+
+  function updateSplitTotal(form) {
+    var total = form.querySelector('.split-net-total');
+    if (!total) return;
+    var cents = 0, valid = true;
+    form.querySelectorAll('input[name=amounts]').forEach(function (input) {
+      var value = input.value.trim();
+      if (!value) return;
+      if (!/^-?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\\.[0-9]{1,2})?$/.test(value)) { valid = false; return; }
+      var amount = Math.round(Number(value.replace(/,/g, '')) * 100);
+      if (!Number.isSafeInteger(amount)) { valid = false; return; }
+      cents += amount;
+    });
+    total.textContent = valid && Number.isSafeInteger(cents) ? '本次分摊净额：¥ ' + (cents / 100).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}) : '本次分摊净额：请检查金额格式';
+  }
+  document.addEventListener('input', function (event) {
+    if (event.target.name === 'amounts' && event.target.form) updateSplitTotal(event.target.form);
+  });
+  document.querySelectorAll('.split-net-total').forEach(function (node) { updateSplitTotal(node.closest('form')); });
+})();
+"""
+
+
 CASCADE_JS = """
 function fillSelect(sel, items, placeholder) {
   if (!sel) return;
@@ -2572,6 +2866,7 @@ def submit_batch_claims(
     note: str = "",
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     department = require_department(department)
     team = team.strip()
     customer_project = customer_project.strip()
@@ -2598,6 +2893,7 @@ def submit_batch_claims(
             skipped.append({"payment_id": payment_id, "reason": "status", "status": row["status"]})
             continue
         totals = claim_totals(conn, payment_id)
+        validate_claim_net(row["amount_cents"], totals["active"])
         remaining_amount = max(row["amount_cents"] - totals["active"], 0)
         if remaining_amount <= 0:
             skipped.append({"payment_id": payment_id, "reason": "no_remaining"})
@@ -2703,6 +2999,7 @@ def split_claim_form_html(row: sqlite3.Row) -> str:
             </table>
           </div>
           <button type="button" class="secondary split-add-row" style="margin:0 0 12px">＋ 添加分摊行</button>
+          <div class="split-net-total" role="status">本次分摊净额：¥ 0.00</div>
           <p class="hint" style="margin:0 0 12px">只填写需要分摊的行，退款项目请填负数；分摊净额合计必须大于 0，且不能超过该笔款剩余可认领金额。</p>
           <button type="submit">提交分摊认领</button>
         </form>
@@ -2741,6 +3038,7 @@ def submit_split_claims(
     notes: list[str],
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
     if not payment:
         raise HTTPException(status_code=404, detail="到款记录不存在")
@@ -2764,7 +3062,7 @@ def submit_split_claims(
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 行中心/小组不属于所选部门")
         if project not in CATALOG[department][team]:
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 行项目不属于所选中心/小组")
-        amount_cents = parse_amount(amount_text)
+        amount_cents = parse_form_amount(amount_text)
         if amount_cents == 0:
             raise HTTPException(status_code=400, detail=f"第 {index + 1} 行分摊金额不能为 0，退款请填负数")
         lines.append(
@@ -2781,6 +3079,7 @@ def submit_split_claims(
         raise HTTPException(status_code=400, detail="请至少填写一条分摊明细")
     totals = claim_totals(conn, payment_id)
     new_total = sum(line["amount_cents"] for line in lines)
+    validate_claim_net(payment["amount_cents"], totals["active"])
     if new_total <= 0:
         raise HTTPException(status_code=400, detail="分摊金额合计必须大于 0")
     if totals["active"] + new_total > payment["amount_cents"]:
@@ -3098,8 +3397,8 @@ def submit_split_claim(
     if not actor.get("authed"):
         raise HTTPException(status_code=403, detail="请先用飞书登录后再提交分摊认领")
     with get_conn() as conn:
-        submit_split_claims(conn, actor, payment_id, departments, teams, projects, amounts, notes, request)
-    return RedirectResponse(f"/split-claim?q=%23{payment_id}", status_code=303)
+        detail = submit_split_claims(conn, actor, payment_id, departments, teams, projects, amounts, notes, request)
+    return action_redirect(request, f"/split-claim?q=%23{payment_id}", f"已保存 {detail['count']} 条分摊，认领净额 ¥ {money(detail['amount_cents'])}。")
 
 
 @app.post("/claim/batch")
@@ -3115,7 +3414,7 @@ def submit_batch_claim_route(
     if not actor.get("authed"):
         raise HTTPException(status_code=403, detail="请先用飞书登录后再提交批量认领")
     with get_conn() as conn:
-        submit_batch_claims(
+        detail = submit_batch_claims(
             conn,
             actor,
             payment_ids or [],
@@ -3125,7 +3424,12 @@ def submit_batch_claim_route(
             note,
             request,
         )
-    return RedirectResponse("/search", status_code=303)
+    message = f"已认领 {detail['count']} 笔到款。"
+    if detail["skipped"]:
+        reasons = {"not_found": "记录不存在", "status": "状态已变化", "no_remaining": "已无剩余金额"}
+        skipped = "；".join(f"#{item['payment_id']}：{reasons[item['reason']]}" for item in detail["skipped"][:10])
+        message += f"跳过 {len(detail['skipped'])} 笔（{skipped}{'；其余请刷新核对' if len(detail['skipped']) > 10 else ''}）。"
+    return action_redirect(request, "/search", message)
 
 
 def validate_search_query(q: str) -> tuple[bool, str]:
@@ -3198,15 +3502,11 @@ def submit_claim(
         raise HTTPException(status_code=400, detail="请选择该部门下的中心/小组")
     if customer_project not in CATALOG[department][team]:
         raise HTTPException(status_code=400, detail="请选择该中心/小组下的项目")
-    # 已登录则认领归到会话身份，不信任表单 user/name（防冒名认领）；未登录走 demo 表单身份
-    session = read_session(request.cookies.get(SESSION_COOKIE, ""))
-    if session:
-        actor = {**actor_from_request(request), "department": department}
-    else:
-        if REQUIRE_LOGIN_FOR_CLAIM:
-            raise HTTPException(status_code=403, detail="请先用飞书登录后再提交认领")
-        actor = actor_from_form(user, name, role, department)
+    actor = {**actor_from_request(request), "department": department}
+    if not actor.get("authed"):
+        raise HTTPException(status_code=401, detail="请先用飞书登录后再提交认领")
     with get_conn() as conn:
+        begin_write(conn)
         row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="记录不存在")
@@ -3215,9 +3515,8 @@ def submit_claim(
 
         totals = claim_totals(conn, payment_id)
         remaining_amount = max(row["amount_cents"] - totals["active"], 0)
-        requested_amount = parse_amount(claim_amount)
-        if requested_amount <= 0:
-            requested_amount = remaining_amount if totals["active"] > 0 else row["amount_cents"]
+        validate_claim_net(row["amount_cents"], totals["active"])
+        requested_amount = parse_form_amount(claim_amount) if claim_amount.strip() else remaining_amount
         if requested_amount <= 0:
             raise HTTPException(status_code=400, detail="认领金额必须大于 0")
         if requested_amount > row["amount_cents"]:
@@ -3301,7 +3600,7 @@ def submit_claim(
             request,
         )
 
-    return RedirectResponse(url("/search", user=user, name=name, department=department), status_code=303)
+    return action_redirect(request, "/search", f"认领已提交，金额 ¥ {money(requested_amount)}。")
 
 
 ROLE_LABELS = {
@@ -3569,6 +3868,7 @@ def summarize_dashboard_entries(entries: list[dict[str, Any]], limit: int = 50) 
 
     return {
         "total_cents": total,
+        "row_count": len(rows),
         "customers": top_items(customers),
         "departments": top_items(departments),
         "rows": sorted(
@@ -3668,10 +3968,10 @@ def render_dashboard_rows(rows: list[dict[str, Any]], filters: Optional[dict[str
         f"""
         <tr>
           <td class="nowrap">{('#' + esc(row['payment_id'])) if row.get('payment_id') is not None else ''}</td>
-          <td>{esc(row["payer_name"])}</td>
-          <td>{esc(receiver_company_label(row.get("receiver_company")))}</td>
-          <td>{esc(row.get("bank_note") or "")}{claim_details(row)}</td>
-          <td>{esc(row["department"])}</td>
+          <td data-label="付款客户">{esc(row["payer_name"])}</td>
+          <td data-label="到款公司">{esc(receiver_company_label(row.get("receiver_company")))}</td>
+          <td data-label="摘要">{esc(row.get("bank_note") or "")}{claim_details(row)}</td>
+          <td data-label="款项所属部门">{esc(row["department"])}</td>
           <td class="num">¥ {money(row["amount_cents"])}</td>
         </tr>
         """
@@ -3782,6 +4082,9 @@ def render_personal_dashboard(
 ) -> str:
     cards = []
     for item in dashboard:
+        row_count = item.get("row_count", len(item["rows"]))
+        row_notice = (f'<p class="hint">当前显示前 {len(item["rows"])} 条，共 {row_count} 条；合计包含全部匹配款项。</p>'
+                      if row_count > len(item["rows"]) else "")
         date_range = item["start"].strftime("%Y-%m-%d")
         if item["start"] != item["end"]:
             date_range += " 至 " + item["end"].strftime("%Y-%m-%d")
@@ -3796,6 +4099,7 @@ def render_personal_dashboard(
                 <div class="dash-amount">¥ {money(item["total_cents"])}</div>
               </div>
               {render_dashboard_rows(item["rows"], filters, departments, context)}
+              {row_notice}
             </div>
             """
         )
@@ -3874,6 +4178,8 @@ def personal_center(
 ) -> HTMLResponse:
     actor = actor_from_request(request)
     can_filter = bool(actor.get("authed")) and actor["role"] in {"admin", "finance", "superadmin"}
+    if not actor.get("authed"):
+        raise HTTPException(status_code=401, detail="请先用飞书登录")
     column_filters = dict(filter_payer=filter_payer, filter_receiver=filter_receiver, filter_summary=filter_summary) if can_filter else {}
     if not can_filter:
         dashboard_department = ""
@@ -4054,7 +4360,7 @@ def cancel_my_claim_route(request: Request, claim_id: int) -> RedirectResponse:
         raise HTTPException(status_code=403, detail="请先用飞书登录")
     with get_conn() as conn:
         cancel_my_claim(conn, actor, claim_id, request)
-    return RedirectResponse("/me", status_code=303)
+    return action_redirect(request, "/me", "认领已取消。")
 
 
 @app.post("/me/profile")
@@ -4238,24 +4544,14 @@ def export_today_payments(request: Request) -> Response:
     require_admin(actor)
     start_date, end_date = admin_export_range(request)
     with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, received_date, received_time, payer_name, amount_cents, bank_note,
-                   receiver_company, receiver_account, serial_no, status, claimed_department, claimed_team,
-                   customer_project, claimed_by_name, claimed_at, claim_note, finance_note,
-                   source_ref, imported_at, confirmed_at
-            FROM payments
-            WHERE received_date BETWEEN ? AND ?
-            ORDER BY received_date DESC, id DESC
-            """,
-            (start_date, end_date),
-        ).fetchall()
+        dataset = export_payment_data(conn, start_date, end_date)
+        conn.commit()
         audit(
             conn,
             actor,
             "export_today_payments",
             None,
-            {"start_date": start_date, "end_date": end_date, "count": len(rows)},
+            {"start_date": start_date, "end_date": end_date, "count": len(dataset)},
             request,
         )
 
@@ -4289,20 +4585,11 @@ def export_today_payments(request: Request) -> Response:
         ]
     )
     unclaimed_rows: list[tuple[sqlite3.Row, int]] = []
-    for row in rows:
-        with get_conn() as conn:
-            claim_rows = conn.execute(
-                "SELECT * FROM claims WHERE payment_id = ? AND status IN ('pending', 'accepted') ORDER BY id",
-                (row["id"],),
-            ).fetchall()
-        active_amount_cents = sum(int(claim["amount_cents"] or 0) for claim in claim_rows)
-        remaining_cents = max(int(row["amount_cents"] or 0) - active_amount_cents, 0)
-        if row["status"] in {"pending", "partial_claiming"} and remaining_cents > 0:
+    for row, claim_rows, remaining_cents in reversed(dataset):
+        if remaining_cents > 0:
             unclaimed_rows.append((row, remaining_cents))
         if not claim_rows:
-            if row["status"] in {"pending", "partial_claiming"}:
-                continue
-            claim_rows = [None]
+            continue
         for claim in claim_rows:
             writer.writerow(
                 [
@@ -4414,51 +4701,44 @@ def build_today_claim_plain_text(conn: sqlite3.Connection, date_text: str) -> st
     return build_claim_plain_text(conn, date_text, date_text)
 
 
-def unclaimed_payer_amounts(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[tuple[str, int]]:
-    rows = conn.execute(
-        """
-        SELECT
-            p.id AS payment_id,
-            p.payer_name AS payer_name,
-            p.amount_cents AS payment_amount_cents,
-            COALESCE(SUM(CASE WHEN c.status IN ('pending', 'accepted') THEN c.amount_cents ELSE 0 END), 0)
-                AS claimed_amount_cents
-        FROM payments p
-        LEFT JOIN claims c ON c.payment_id = p.id
+def export_payment_data(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[tuple[sqlite3.Row, list[sqlite3.Row], int]]:
+    # 两种导出共用同一范围、同一读取快照；草稿、关闭和已退回旧状态不计入。
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    payments = conn.execute("""SELECT * FROM payments
+        WHERE received_date BETWEEN ? AND ?
+          AND status IN ('pending', 'partial_claiming', 'claimed', 'pending_confirm')
+        ORDER BY received_date, id""", (start_date, end_date)).fetchall()
+    claims = conn.execute("""SELECT c.* FROM claims c JOIN payments p ON p.id = c.payment_id
         WHERE p.received_date BETWEEN ? AND ?
-          AND p.status IN ('pending', 'partial_claiming')
-        GROUP BY p.id
-        """,
-        (start_date, end_date),
-    ).fetchall()
+          AND p.status IN ('pending', 'partial_claiming', 'claimed', 'pending_confirm')
+          AND c.status IN ('pending', 'accepted') ORDER BY c.id""", (start_date, end_date)).fetchall()
+    by_payment: dict[int, list[sqlite3.Row]] = {}
+    for claim in claims:
+        by_payment.setdefault(claim["payment_id"], []).append(claim)
+    result = []
+    for payment in payments:
+        items = by_payment.get(payment["id"], [])
+        active = sum(int(item["amount_cents"] or 0) for item in items)
+        validate_claim_net(payment["amount_cents"], active)
+        result.append((payment, items, payment["amount_cents"] - active))
+    return result
+
+
+def unclaimed_payer_amounts(conn: sqlite3.Connection, start_date: str, end_date: str, dataset=None) -> list[tuple[str, int]]:
+    dataset = export_payment_data(conn, start_date, end_date) if dataset is None else dataset
     payer_items: dict[str, int] = {}
-    for row in rows:
+    for row, _, remaining in dataset:
         payer = (row["payer_name"] or "").strip() or "未填写付款方"
-        remaining = int(row["payment_amount_cents"] or 0) - int(row["claimed_amount_cents"] or 0)
         if remaining > 0:
             payer_items[payer] = payer_items.get(payer, 0) + remaining
     return [(payer, amount_cents) for payer, amount_cents in payer_items.items()]
 
 
 def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: str) -> str:
-    rows = conn.execute(
-        """
-        SELECT
-            p.id AS payment_id,
-            p.received_date AS received_date,
-            p.payer_name AS payer_name,
-            c.department AS department,
-            c.customer_project AS customer_project,
-            c.amount_cents AS amount_cents
-        FROM payments p
-        JOIN claims c ON c.payment_id = p.id
-        WHERE p.received_date BETWEEN ? AND ?
-          AND p.status != 'closed'
-          AND c.status IN ('pending', 'accepted')
-        ORDER BY p.received_date, p.id, c.id
-        """,
-        (start_date, end_date),
-    ).fetchall()
+    dataset = export_payment_data(conn, start_date, end_date)
+    rows = [{**dict(claim), "payer_name": payment["payer_name"]}
+            for payment, claims, _ in dataset for claim in claims]
 
     payer_items: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -4484,7 +4764,7 @@ def build_claim_plain_text(conn: sqlite3.Connection, start_date: str, end_date: 
             project_parts = [f"{project}{money(amount)}元" for project, amount in projects.items()]
             department_parts.append(f"{department}  {'，'.join(project_parts)}")
         lines.append(f"{index}.{payer}\t{money(item['total'])}元（{'；'.join(department_parts)}）")
-    for payer, amount_cents in unclaimed_payer_amounts(conn, start_date, end_date):
+    for payer, amount_cents in unclaimed_payer_amounts(conn, start_date, end_date, dataset):
         index += 1
         lines.append(f"{index}.{payer}\t{money(amount_cents)}元（未认领）")
         grand_total += amount_cents
@@ -4501,6 +4781,7 @@ def export_today_claim_plain_text(request: Request) -> Response:
     start_date, end_date = admin_export_range(request)
     with get_conn() as conn:
         text = build_claim_plain_text(conn, start_date, end_date)
+        conn.commit()
         active_count = len([line for line in text.splitlines() if re.match(r"^\d+\.", line)])
         audit(
             conn,
@@ -4887,7 +5168,7 @@ def admin_page(
     {render_payment_pool_html(payments, actor, sort, dir)}
 
     <h2>项目管理</h2>
-    <div class="panel">
+    <div class="panel catalog-panel">
       <div style="font-weight:600; margin-bottom:12px">组织架构</div>
       <div class="row" style="align-items:end">
         <form method="post" action="/admin/catalog/departments" class="row" style="align-items:end; flex:1; min-width:300px">
@@ -5427,8 +5708,8 @@ def confirm_batch(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
-        confirm_import_batch(conn, actor, batch_id, request)
-    return RedirectResponse("/admin", status_code=303)
+        detail = confirm_import_batch(conn, actor, batch_id, request)
+    return action_redirect(request, "/admin", f"已确认 {detail['count']} 笔到款入池。")
 
 
 def confirm_import_batch(
@@ -5437,6 +5718,7 @@ def confirm_import_batch(
     batch_id: int,
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     rows = conn.execute(
         "SELECT id, amount_cents FROM payments WHERE batch_id = ? AND status = 'draft'",
         (batch_id,),
@@ -5448,15 +5730,15 @@ def confirm_import_batch(
     )
     conn.execute("UPDATE import_batches SET status = 'confirmed' WHERE id = ?", (batch_id,))
 
-    notified = False
+    queued = False
     if rows:
-        notified = feishu_send_chat_text(FEISHU_NOTIFY_CHAT_ID, build_batch_confirm_message())
+        queued = enqueue_notification(conn, f"confirm_batch:{batch_id}", FEISHU_NOTIFY_CHAT_ID, build_batch_confirm_message(), "chat_id")
 
     detail = {
         "batch_id": batch_id,
         "count": len(rows),
         "amount_cents": total_cents,
-        "notified": notified,
+        "notification_queued": queued,
     }
     audit(conn, actor, "confirm_batch", None, detail, request)
     return detail
@@ -5471,6 +5753,7 @@ def cancel_batch(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
+        begin_write(conn)
         batch = conn.execute("SELECT * FROM import_batches WHERE id = ?", (batch_id,)).fetchone()
         if not batch:
             raise HTTPException(status_code=404, detail="批次不存在")
@@ -5495,6 +5778,7 @@ def close_payments_bulk(
     payment_ids: list[int],
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     unique_ids: list[int] = []
     seen: set[int] = set()
     for payment_id in payment_ids:
@@ -5559,15 +5843,18 @@ def bulk_close_payments_route(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
-        close_payments_bulk(conn, actor, payment_ids or [], request)
-    return RedirectResponse("/admin", status_code=303)
+        detail = close_payments_bulk(conn, actor, payment_ids or [], request)
+    return action_redirect(request, "/admin", f"已关闭 {detail['count']} 笔，跳过 {detail['skipped']} 笔。")
 
 
 def refresh_payment_claim_status(conn: sqlite3.Connection, payment_id: int) -> None:
     row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
     if not row:
         return
+    if row["status"] in {"closed", "rejected", "draft"}:
+        return
     totals = claim_totals(conn, payment_id)
+    validate_claim_net(row["amount_cents"], totals["active"])
     active_claims = conn.execute(
         """
         SELECT *
@@ -5659,9 +5946,12 @@ def reset_payment_to_initial_pending(
     request: Optional[Request] = None,
     detail_extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
     if not payment:
         raise HTTPException(status_code=404, detail="到款记录不存在")
+    if payment["status"] == "draft":
+        raise HTTPException(status_code=409, detail="待确认款项请通过批次确认或取消处理")
     reason = reason.strip()
     active_claims = conn.execute(
         """
@@ -5781,6 +6071,11 @@ def repair_pending_claims_to_accepted(conn: sqlite3.Connection) -> dict[str, Any
         claim_ids = [int(value) for value in str(row["claim_ids"] or "").split(",") if value]
         if not claim_ids:
             continue
+        payment = conn.execute("SELECT amount_cents FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        active = claim_totals(conn, payment_id)["active"]
+        if not payment or not 0 <= active <= payment["amount_cents"]:
+            logging.warning("跳过异常历史认领自动迁移，需财务核对：payment_id=%s", payment_id)
+            continue
         placeholders = ",".join("?" for _ in claim_ids)
         conn.execute(
             f"UPDATE claims SET status = 'accepted' WHERE id IN ({placeholders})",
@@ -5805,6 +6100,7 @@ def cancel_my_claim(
     claim_id: int,
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
     if not claim:
         raise HTTPException(status_code=404, detail="认领记录不存在")
@@ -5815,6 +6111,11 @@ def cancel_my_claim(
 
     payment_id = int(claim["payment_id"])
     payment_before = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    if not payment_before:
+        raise HTTPException(status_code=404, detail="到款记录不存在")
+    if payment_before["status"] in {"closed", "rejected", "draft"}:
+        raise HTTPException(status_code=409, detail="该款项当前不能取消认领，请联系财务处理")
+    validate_claim_net(payment_before["amount_cents"], claim_totals(conn, payment_id)["active"] - claim["amount_cents"])
     conn.execute("UPDATE claims SET status = 'canceled' WHERE id = ?", (claim_id,))
     refresh_payment_claim_status(conn, payment_id)
     payment = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
@@ -5843,9 +6144,13 @@ def accept_payment_claims(
     payment_id: int,
     request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    begin_write(conn)
     payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
     if not payment:
         raise HTTPException(status_code=404, detail="到款记录不存在")
+    if payment["status"] in {"closed", "rejected", "draft"}:
+        raise HTTPException(status_code=409, detail="当前款项状态不能处理认领")
+    validate_claim_net(payment["amount_cents"], claim_totals(conn, payment_id)["active"])
     pending_claims = conn.execute(
         "SELECT * FROM claims WHERE payment_id = ? AND status = 'pending' ORDER BY id",
         (payment_id,),
@@ -5892,6 +6197,7 @@ def accept_claim(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
+        begin_write(conn)
         claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
         if not claim:
             raise HTTPException(status_code=404, detail="认领记录不存在")
@@ -5900,6 +6206,9 @@ def accept_claim(
         payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
         if not payment:
             raise HTTPException(status_code=404, detail="到款记录不存在")
+        if payment["status"] in {"closed", "rejected", "draft"}:
+            raise HTTPException(status_code=409, detail="当前款项状态不能处理认领")
+        validate_claim_net(payment["amount_cents"], claim_totals(conn, payment["id"])["active"])
         accepted = claim_totals(conn, claim["payment_id"])["accepted"]
         if accepted + claim["amount_cents"] > payment["amount_cents"]:
             raise HTTPException(status_code=409, detail="处理后金额会超过到款金额")
@@ -5924,15 +6233,19 @@ def reject_claim(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
+        begin_write(conn)
         claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
         if not claim:
             raise HTTPException(status_code=404, detail="认领记录不存在")
         if claim["status"] != "pending":
             raise HTTPException(status_code=409, detail="只有待处理认领可以驳回")
         payment = conn.execute("SELECT * FROM payments WHERE id = ?", (claim["payment_id"],)).fetchone()
-        notified = False
-        if payment:
-            notified = feishu_send_text(claim["actor_id"], build_claim_reject_message(payment, claim))
+        if not payment:
+            raise HTTPException(status_code=404, detail="到款记录不存在")
+        if payment["status"] in {"closed", "rejected", "draft"}:
+            raise HTTPException(status_code=409, detail="当前款项状态不能处理认领")
+        validate_claim_net(payment["amount_cents"], claim_totals(conn, payment["id"])["active"] - claim["amount_cents"])
+        queued = enqueue_notification(conn, f"reject_claim:{claim_id}", claim["actor_id"], build_claim_reject_message(payment, claim))
         conn.execute("UPDATE claims SET status = 'rejected' WHERE id = ?", (claim_id,))
         refresh_payment_claim_status(conn, claim["payment_id"])
         audit(
@@ -5940,7 +6253,7 @@ def reject_claim(
             actor,
             "reject_claim",
             claim["payment_id"],
-            {"claim_id": claim_id, "amount_cents": claim["amount_cents"], "notified": notified},
+            {"claim_id": claim_id, "amount_cents": claim["amount_cents"], "notification_queued": queued},
             request,
         )
     return RedirectResponse("/admin", status_code=303)
@@ -5960,6 +6273,14 @@ def edit_payment(
     actor = actor_from_request(request)
     require_admin(actor)
     with get_conn() as conn:
+        begin_write(conn)
+        payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not payment:
+            raise HTTPException(status_code=404, detail="到款记录不存在")
+        new_amount = parse_form_amount(amount)
+        if new_amount <= 0:
+            raise HTTPException(status_code=400, detail="到款金额必须大于 0")
+        validate_claim_net(new_amount, claim_totals(conn, payment_id)["active"])
         conn.execute(
             """
             UPDATE payments
@@ -5968,13 +6289,14 @@ def edit_payment(
             """,
             (
                 parse_date(received_date),
-                parse_amount(amount),
+                new_amount,
                 receiver_company.strip(),
                 payer_name.strip(),
                 bank_note.strip(),
                 payment_id,
             ),
         )
+        refresh_payment_claim_status(conn, payment_id)
         audit(
             conn,
             actor,
@@ -6004,9 +6326,19 @@ def resolve_payment(
     team = team.strip()
     if department and department not in DEPARTMENTS:
         raise HTTPException(status_code=400, detail="请选择标准部门")
-    if status == "claimed" and not department:
-        raise HTTPException(status_code=400, detail="标记已认领时必须选择部门")
     with get_conn() as conn:
+        begin_write(conn)
+        payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not payment:
+            raise HTTPException(status_code=404, detail="到款记录不存在")
+        if payment["status"] == "draft":
+            raise HTTPException(status_code=409, detail="待确认款项请通过批次确认或取消处理")
+        totals = claim_totals(conn, payment_id)
+        if status not in {"closed", "rejected"}:
+            validate_claim_net(payment["amount_cents"], totals["active"])
+            expected = "pending" if totals["active"] == 0 else ("claimed" if totals["active"] == payment["amount_cents"] else "partial_claiming")
+            if status != expected:
+                raise HTTPException(status_code=409, detail=f"状态与有效认领金额不一致，应为 {expected}；需要清除认领请使用驳回退回")
         if team:
             row = conn.execute(
                 "SELECT claimed_department FROM payments WHERE id = ?", (payment_id,)
@@ -6056,6 +6388,9 @@ def resolve_payment(
                 """,
                 (status, department, team, status, now_text(), finance_note, payment_id),
             )
+        if status != "closed":
+            refresh_payment_claim_status(conn, payment_id)
+            conn.execute("UPDATE payments SET finance_note = ? WHERE id = ?", (finance_note, payment_id))
         audit(conn, actor, "resolve_payment", payment_id, {"status": status, "department": department, "team": team}, request)
     return RedirectResponse("/admin", status_code=303)
 
@@ -6070,14 +6405,14 @@ def reject_payment(
     require_admin(actor)
     reason = reason.strip()
     with get_conn() as conn:
+        begin_write(conn)
         row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="记录不存在")
         claimed_by = row["claimed_by"]
-        # 先通知原认领人（飞书单聊），失败不影响退回
-        notified = False
+        queued = False
         if claimed_by:
-            notified = feishu_send_text(claimed_by, build_payment_reject_message(row, reason))
+            queued = enqueue_notification(conn, f"reject_payment:{payment_id}:{uuid.uuid4()}", claimed_by, build_payment_reject_message(row, reason))
         detail = reset_payment_to_initial_pending(
             conn,
             actor,
@@ -6085,7 +6420,7 @@ def reject_payment(
             reason,
             action="reject_payment",
             request=request,
-            detail_extra={"prev_claimed_by": claimed_by, "notified": notified},
+            detail_extra={"prev_claimed_by": claimed_by, "notification_queued": queued},
         )
     return RedirectResponse("/admin", status_code=303)
 

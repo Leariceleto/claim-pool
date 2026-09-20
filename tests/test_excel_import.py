@@ -321,7 +321,7 @@ class ExcelImportTests(unittest.TestCase):
         audit_detail = json.loads(audit_row["detail_json"])
         self.assertEqual(audit_detail["count"], 2)
 
-    def test_confirm_import_batch_sends_group_notification(self) -> None:
+    def test_confirm_import_batch_queues_group_notification(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -357,9 +357,9 @@ class ExcelImportTests(unittest.TestCase):
         )
         sent: list[tuple[str, str]] = []
         old_chat_id = self.app.FEISHU_NOTIFY_CHAT_ID
-        old_send = self.app.feishu_send_chat_text
+        old_send = self.app.enqueue_notification
         self.app.FEISHU_NOTIFY_CHAT_ID = "oc_test_chat"
-        self.app.feishu_send_chat_text = lambda chat_id, text: sent.append((chat_id, text)) or True
+        self.app.enqueue_notification = lambda conn, key, chat_id, text, kind: sent.append((chat_id, text)) or True
         try:
             detail = self.app.confirm_import_batch(
                 conn,
@@ -368,7 +368,7 @@ class ExcelImportTests(unittest.TestCase):
             )
         finally:
             self.app.FEISHU_NOTIFY_CHAT_ID = old_chat_id
-            self.app.feishu_send_chat_text = old_send
+            self.app.enqueue_notification = old_send
 
         statuses = conn.execute("SELECT id, status FROM payments ORDER BY id").fetchall()
         batch = conn.execute("SELECT status FROM import_batches WHERE id = 7").fetchone()
@@ -376,7 +376,7 @@ class ExcelImportTests(unittest.TestCase):
 
         self.assertEqual(detail["count"], 2)
         self.assertEqual(detail["amount_cents"], 46567)
-        self.assertTrue(detail["notified"])
+        self.assertTrue(detail["notification_queued"])
         self.assertEqual([(row["id"], row["status"]) for row in statuses], [(1, "pending"), (2, "pending"), (3, "pending")])
         self.assertEqual(batch["status"], "confirmed")
         self.assertEqual(sent[0][0], "oc_test_chat")
@@ -385,7 +385,7 @@ class ExcelImportTests(unittest.TestCase):
             "【今日到款已入池】\n新一批到款流水已完成入池，请相关同事进入财务到款认领系统查看并认领。",
         )
         self.assertEqual(audit_row["action"], "confirm_batch")
-        self.assertTrue(json.loads(audit_row["detail_json"])["notified"])
+        self.assertTrue(json.loads(audit_row["detail_json"])["notification_queued"])
 
     def test_confirm_import_batch_continues_when_group_notification_is_unconfigured(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -434,7 +434,7 @@ class ExcelImportTests(unittest.TestCase):
 
         payment = conn.execute("SELECT status FROM payments WHERE id = 1").fetchone()
         self.assertEqual(payment["status"], "pending")
-        self.assertFalse(detail["notified"])
+        self.assertFalse(detail["notification_queued"])
 
     def test_reject_notification_messages_include_reason_without_links(self) -> None:
         payment_message = self.app.build_payment_reject_message(
@@ -623,14 +623,14 @@ class ExcelImportTests(unittest.TestCase):
 
         sent: list[tuple[str, str]] = []
         old_superadmins = self.app.FEISHU_SUPERADMIN_OPEN_IDS
-        old_send = self.app.feishu_send_text
+        old_send = self.app.enqueue_notification
         self.app.FEISHU_SUPERADMIN_OPEN_IDS = {"super-1"}
-        self.app.feishu_send_text = lambda open_id, text: sent.append((open_id, text)) or True
+        self.app.enqueue_notification = lambda conn, key, open_id, text: sent.append((open_id, text)) or True
         try:
             detail = self.app.cancel_my_claim(conn, actor, 1)
         finally:
             self.app.FEISHU_SUPERADMIN_OPEN_IDS = old_superadmins
-            self.app.feishu_send_text = old_send
+            self.app.enqueue_notification = old_send
 
         payment = conn.execute("SELECT status, claimed_by, claimed_department FROM payments WHERE id = 1").fetchone()
         claim = conn.execute("SELECT status FROM claims WHERE id = 1").fetchone()
@@ -638,7 +638,8 @@ class ExcelImportTests(unittest.TestCase):
         audit_detail = json.loads(audit_row["detail_json"])
 
         self.assertEqual(detail["payment_status"], "pending")
-        self.assertTrue(detail["admin_notified"])
+        self.assertFalse(detail["admin_notified"])
+        self.assertEqual(detail["admin_queued_count"], 1)
         self.assertEqual(detail["admin_notify_count"], 1)
         self.assertEqual(claim["status"], "canceled")
         self.assertEqual(payment["status"], "pending")
@@ -650,7 +651,7 @@ class ExcelImportTests(unittest.TestCase):
         self.assertIn("付款方：测试客户", sent[0][1])
         self.assertIn("取消认领金额：¥ 7,760.00", sent[0][1])
         self.assertEqual(audit_row["action"], "cancel_my_claim")
-        self.assertTrue(audit_detail["admin_notified"])
+        self.assertFalse(audit_detail["admin_notified"])
         self.assertEqual(audit_detail["admin_notify_count"], 1)
 
     def test_cancel_my_claim_rejects_other_users_claim(self) -> None:

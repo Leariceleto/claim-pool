@@ -76,3 +76,51 @@ SQLite 库和上传附件目录必须落在持久磁盘上，路径用环境变�
 GitHub（private）：https://github.com/Leariceleto/claim-pool
 
 有疑问联系 Lear。
+
+## 九、2026-09-20 正确性修复升级
+
+### 范围与准备
+
+- 仍是单文件 FastAPI + SQLite。没有新增运行依赖、中间件或常驻服务，不需要 Redis/Celery。
+- 新增同库 `notification_outbox` 表和索引，启动自动创建；补列沿用 `ensure_column`，可重复执行。旧 `payment_reminders` 快照、逐人成功记录会继续使用，不重发已记录成功的接收人。
+- 不新增环境变量。保留原有非空 `SESSION_SECRET`、飞书配置、`CLAIM_POOL_DB` 和 `CLAIM_UPLOAD_DIR`。所有数据页面、导出及写接口都要求签名登录，旧 `REQUIRE_LOGIN_FOR_CLAIM=false` 不再允许匿名认领。
+- 升级前停止旧进程并备份现有 SQLite（可用 sqlite3 的 `.backup`）及附件，再启动新版本；不要混跑旧通知发送器与新队列，不要清空或替换生产库。保持现有单实例部署，不为本次升级增加 workers。
+- 先在独立测试库执行 `/usr/bin/python3 -m unittest discover -s tests`（生产对应 Python 命令按环境替换）。测试不会访问生产库或发送真实消息，无需额外测试组件。本地已验证 Python 3.9；生产 Python 3.12 仍需运行验收。
+
+### 可观察的变化
+
+- 余额校验与认领/取消/后台更正同事务。非法金额报错；单独取消退款行若使净额为负或超过到款，会拒绝，需关联修正或整笔驳回再认领。
+- 普通取消不会重新打开关闭款项。有有效认领时不能直接标记待认领；退回需使用明确的“驳回退回”，保留认领历史。
+- 通知不在业务请求中同步发送。写入成功意味着通知已入队，不等于已经送达；审计记录使用 `notification_queued`/`admin_queued_count`，真实结果查看队列表。
+- 后台线程轮询队列；发送网络请求时不持写锁。失败从 60 秒开始指数退避，最长 1 小时；进程异常后的发送租约在 5 分钟后可重新领取。服务必须常驻。
+- 次日 17 点仍未确认的草稿不发提醒，但保留调度，之后确认入池会补查。旧流水没有调度时间的不追溯；旧提醒快照的未发送接收人继续重试。
+- CSV/纯文本统一排除草稿、关闭及旧 rejected 款项，只计算有效认领及剩余额度。异常净额会报错而非导出错误合计。
+- 页面表单在原位显示校验错误并保留输入，成功后显示反馈；批量认领显示成功/跳过笔数。网络中断时不自动重试 POST，需先刷新核对结果。普通浏览器表单仍使用 303 跳转；带 `X-Requested-With: fetch` 的 POST 成功返回 JSON 中的 `redirect` 和 `message`。页面脚本与后端必须同时更新。
+
+### 验收与排错
+
+1. 未登录访问 `/me` 应跳转登录，未登录 POST 应返回 401；正常登录及管理员身份变更后权限正常。
+2. 两人同时认领同一笔剩余金额，只允许符合最新余额的请求成功；拒绝时原数据不变。
+3. 验证本人取消通知只发管理员、不发超管；入池群通知和董芳/何玲私信保持原接收范围。
+4. 通过下列只读 SQL 检查发送状态，不要靠“HTTP 307 正常”判断机器人已送达：
+
+```sql
+SELECT status, COUNT(*) FROM notification_outbox GROUP BY status;
+SELECT id, event_key, recipient_type, recipient_id, status, attempts,
+       last_attempt_at, last_error, datetime(available_at, 'unixepoch') AS retry_at_utc,
+       sent_at
+FROM notification_outbox ORDER BY id DESC LIMIT 30;
+```
+
+上线前可只读核对历史净额异常；本次不自动改账：
+
+```sql
+SELECT p.id, p.amount_cents,
+       COALESCE(SUM(CASE WHEN c.status IN ('pending', 'accepted')
+                        THEN c.amount_cents ELSE 0 END), 0) AS active_cents
+FROM payments p LEFT JOIN claims c ON c.payment_id = p.id
+GROUP BY p.id
+HAVING active_cents < 0 OR active_cents > p.amount_cents;
+```
+
+通知使用持久化 UUID 降低重试重复风险。飞书的相同 UUID 去重窗口只有 1 小时；发送成功、结果落库前崩溃且超过窗口才恢复，仍可能重复，不承诺跨系统严格恰好一次。[飞书官方 SDK 参数说明](https://larksuite.github.io/oapi-sdk-java/com/lark/oapi/service/im/v1/model/CreateMessageReqBody.Builder.html#uuid(java.lang.String))
