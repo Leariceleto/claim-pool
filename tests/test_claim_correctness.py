@@ -392,6 +392,23 @@ class ClaimCorrectnessTests(unittest.TestCase):
         self.assertIn(f"#{closed}", message)
         self.assertEqual(self.request("GET", "/admin/export/today-text", authenticated=False, extra_headers=headers).status_code, 401)
 
+    def test_fetch_catalog_project_add_and_delete(self):
+        self.addCleanup(app.refresh_catalog)
+        headers = [(b"x-requested-with", b"fetch")]
+        data = dict(department=self.department, team=self.team,
+                    project="Regression project", action="add")
+        for action, expected_active in [("add", 1), ("delete", 0)]:
+            result = self.request("POST", "/admin/catalog/projects",
+                                  {**data, "action": action}, extra_headers=headers)
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(json.loads(result.text)["redirect"], "/admin?notice=catalog_updated")
+            with closing(app.get_conn()) as conn:
+                row = conn.execute("SELECT active FROM catalog_project_changes WHERE department = ? AND team = ? AND project = ?",
+                                   (self.department, self.team, data["project"])).fetchone()
+            self.assertEqual(row["active"], expected_active)
+        self.assertIn("form.getAttribute('action')", app.FORM_INTERACTION_JS)
+        self.assertNotIn("new URL(form.action,", app.FORM_INTERACTION_JS)
+
     def test_browser_get_error_is_readable_but_api_error_stays_json(self):
         url = "/me?start_date=2026-09-20&end_date=2026-09-01"
         response = self.request("GET", url, extra_headers=[(b"accept", b"text/html")])

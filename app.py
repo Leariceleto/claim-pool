@@ -2178,7 +2178,8 @@ FORM_INTERACTION_JS = """
   document.addEventListener('submit', async function (event) {
     var form = event.target;
     if (!(form instanceof HTMLFormElement) || form.method.toLowerCase() !== 'post' || event.defaultPrevented) return;
-    var target = new URL(form.action, location.href);
+    // A field named "action" shadows the form.action DOM property.
+    var target = new URL(form.getAttribute('action') || location.href, location.href);
     if (target.origin !== location.origin) return;
     event.preventDefault();
     if (form.dataset.submitting) return;
