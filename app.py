@@ -579,6 +579,32 @@ def process_payment_reminders(current_time: Optional[str] = None) -> None:
                     enqueue_notification(conn, f"reminder:{row['payment_id']}", recipient, row["message"])
 
 
+def notify_reminded_payment_claimed(conn: sqlite3.Connection, payment_id: int, claim_ids: list[int], actor: dict[str, str], amount_cents: int) -> None:
+    # The persisted overdue reminder marks payments that need follow-up, even if delivery is retrying.
+    reminder = conn.execute("SELECT recipients_json FROM payment_reminders WHERE payment_id = ?", (payment_id,)).fetchone()
+    if not reminder:
+        return
+    payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    claimed = claim_totals(conn, payment_id)["active"]
+    remaining = payment["amount_cents"] - claimed
+    message = "\n".join([
+        "【到款后续认领提醒】",
+        f"流水 ID：#{payment_id}",
+        f"付款方：{payment['payer_name'] or '未填写'}",
+        f"到款公司：{payment['receiver_company'] or '未填写'}",
+        f"认领人：{actor['name']}",
+        f"本次认领金额：¥ {money(amount_cents)}",
+        f"累计已认领金额：¥ {money(claimed)}",
+        f"剩余未认领金额：¥ {money(remaining)}",
+        f"当前状态：{'已全部认领' if remaining == 0 else '部分认领'}",
+        f"认领时间：{now_text()}",
+        "请进入财务到款认领系统查看认领明细。",
+    ])
+    event_key = f"reminded_claim:{payment_id}:{min(claim_ids)}"
+    for recipient in dict.fromkeys(json.loads(reminder["recipients_json"])):
+        enqueue_notification(conn, event_key, recipient, message)
+
+
 def enqueue_notification(conn: sqlite3.Connection, event_key: str, recipient: str, message: str, recipient_type: str = "open_id") -> bool:
     if not recipient:
         return False
@@ -2308,6 +2334,44 @@ function fillProjectInput(input, items, placeholder) {
     o.value = items[i];
     list.appendChild(o);
   }
+  if (input.tagName === 'SELECT') {
+    input._projectSearch.value = '';
+    input._projectSearch.placeholder = placeholder;
+    filterTouchProjects(input);
+  }
+}
+function filterTouchProjects(select) {
+  var list = document.getElementById(select.getAttribute('list'));
+  var keyword = select._projectSearch.value.trim().toLowerCase();
+  var selected = select.value;
+  var items = Array.prototype.map.call(list.options, function (option) { return option.value; });
+  var matches = items.filter(function (value) { return value.toLowerCase().indexOf(keyword) !== -1; });
+  fillSelect(select, matches, items.length ? (matches.length ? '请选择项目' : '无匹配项目') : '请先选择中心/小组');
+  if (matches.indexOf(selected) !== -1) select.value = selected;
+}
+function enableTouchProjectPicker(input) {
+  if (input.tagName !== 'INPUT' || !window.matchMedia('(any-pointer: coarse)').matches) return;
+  var select = document.createElement('select');
+  select.className = 'cs-project';
+  select.name = input.name;
+  select.required = input.required;
+  select.disabled = input.disabled;
+  select.setAttribute('aria-label', '项目');
+  select.setAttribute('list', input.getAttribute('list'));
+  select.style.marginTop = '8px';
+  var selected = input.value;
+  // Keep the search field out of submitted project values, including split arrays.
+  input.removeAttribute('name');
+  input.removeAttribute('list');
+  input.required = false;
+  input.value = '';
+  input.className = 'cs-project-search';
+  input.setAttribute('aria-label', '项目关键词');
+  select._projectSearch = input;
+  input.insertAdjacentElement('afterend', select);
+  input.addEventListener('input', function () { filterTouchProjects(select); });
+  filterTouchProjects(select);
+  select.value = selected;
 }
 function projectInputHasKnownValue(input) {
   var value = (input.value || '').trim();
@@ -2426,6 +2490,7 @@ function addSplitClaimRow(button) {
   row.appendChild(noteCell);
 
   tbody.appendChild(row);
+  enableTouchProjectPicker(project.input);
   refreshSplitRowNumbers(tbody);
 }
 document.addEventListener('click', function (e) {
@@ -2433,6 +2498,7 @@ document.addEventListener('click', function (e) {
   if (!button) return;
   addSplitClaimRow(button);
 });
+document.querySelectorAll('input.cs-project').forEach(enableTouchProjectPicker);
 """
 
 BULK_ADMIN_JS = """
@@ -2948,6 +3014,8 @@ def submit_batch_claims(
             )
         refresh_payment_claim_status(conn, payment_id)
 
+        notify_reminded_payment_claimed(conn, payment_id, [cur.lastrowid], actor, remaining_amount)
+
     if not created_claim_ids:
         raise HTTPException(status_code=409, detail="选中的到款都无法批量认领，请刷新后重试")
 
@@ -3109,6 +3177,7 @@ def submit_split_claims(
         created_claim_ids.append(cur.lastrowid)
 
     refresh_payment_claim_status(conn, payment_id)
+    notify_reminded_payment_claimed(conn, payment_id, created_claim_ids, actor, new_total)
     payment_after = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
     detail = {
         "payment_id": payment_id,
@@ -3535,7 +3604,7 @@ def submit_claim(
             (row["claimed_department"] or "") != department or (row["claimed_by"] or "") != actor["id"]
         )
         claim_status = "accepted"
-        conn.execute(
+        claim_cursor = conn.execute(
             """
             INSERT INTO claims
                 (payment_id, department, team, amount_cents, actor_id, actor_name, customer_project, contract_invoice, note, status, created_at)
@@ -3587,6 +3656,7 @@ def submit_claim(
                 ),
             )
             action = "claim_submit"
+        notify_reminded_payment_claimed(conn, payment_id, [claim_cursor.lastrowid], actor, requested_amount)
         audit(
             conn,
             actor,

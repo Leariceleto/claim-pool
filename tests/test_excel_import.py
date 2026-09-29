@@ -968,6 +968,7 @@ class ExcelImportTests(unittest.TestCase):
     def test_submit_split_claims_accepts_refund_lines_and_refreshes_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE payment_reminders (payment_id INTEGER PRIMARY KEY, recipients_json TEXT)")
         conn.executescript(
             """
             CREATE TABLE payments (
@@ -1089,6 +1090,7 @@ class ExcelImportTests(unittest.TestCase):
     def test_submit_batch_claims_creates_one_accepted_claim_per_payment(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE payment_reminders (payment_id INTEGER PRIMARY KEY, recipients_json TEXT)")
         conn.executescript(
             """
             CREATE TABLE payments (
@@ -1191,6 +1193,7 @@ class ExcelImportTests(unittest.TestCase):
     def test_submit_batch_claims_uses_remaining_amount_and_skips_invalid_rows(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE payment_reminders (payment_id INTEGER PRIMARY KEY, recipients_json TEXT)")
         conn.executescript(
             """
             CREATE TABLE payments (

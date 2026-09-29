@@ -131,6 +131,64 @@ class ClaimCorrectnessTests(unittest.TestCase):
                 self.assertEqual(sorted(results), [303, 409])
                 self.assertEqual(self.active(pid), 10000)
 
+    def seed_overdue_reminder(self, pid):
+        with closing(app.get_conn()) as conn, conn:
+            conn.execute("INSERT INTO payment_reminders (payment_id, message, recipients_json) VALUES (?, 'Reminder', ?)",
+                         (pid, json.dumps(["d", "h"])))
+
+    def followup_jobs(self, pid):
+        with closing(app.get_conn()) as conn:
+            return conn.execute("SELECT * FROM notification_outbox WHERE event_key LIKE ? ORDER BY id",
+                                (f"reminded_claim:{pid}:%",)).fetchall()
+
+    def test_reminded_claim_all_entry_points_and_no_unrelated_recipients(self):
+        for kind in ["normal", "batch", "split"]:
+            pid = self.payment()
+            self.seed_overdue_reminder(pid)
+            self.assertEqual(self.claim_request(kind, pid).status_code, 303)
+            jobs = self.followup_jobs(pid)
+            self.assertEqual({job["recipient_id"] for job in jobs}, {"d", "h"})
+            self.assertEqual(len(jobs), 2)
+            self.assertIn("已全部认领", jobs[0]["message"])
+            self.assertIn("剩余未认领金额：¥ 0.00", jobs[0]["message"])
+            ordinary = self.payment()
+            self.assertEqual(self.claim_request(kind, ordinary).status_code, 303)
+            self.assertEqual(self.followup_jobs(ordinary), [])
+
+    def test_followup_partial_then_full_and_failed_claim(self):
+        pid = self.payment()
+        self.seed_overdue_reminder(pid)
+        self.assertEqual(self.claim_request("normal", pid, "40").status_code, 303)
+        jobs = self.followup_jobs(pid)
+        self.assertIn("本次认领金额：¥ 40.00", jobs[0]["message"])
+        self.assertIn("剩余未认领金额：¥ 60.00", jobs[0]["message"])
+        self.assertEqual(self.claim_request("normal", pid, "70").status_code, 409)
+        self.assertEqual(len(self.followup_jobs(pid)), 2)
+        self.assertEqual(self.claim_request("normal", pid, "60").status_code, 303)
+        self.assertEqual(len(self.followup_jobs(pid)), 4)
+
+    def test_followup_refund_split_deduplicated_and_transactional(self):
+        pid = self.payment()
+        self.seed_overdue_reminder(pid)
+        result = self.request("POST", f"/split-claim/{pid}", dict(
+            departments=[self.department] * 2, teams=[self.team] * 2,
+            projects=[self.project] * 2, amounts=["120", "-20"], notes=["", ""]))
+        self.assertEqual(result.status_code, 303)
+        self.assertEqual(len(self.followup_jobs(pid)), 2)
+        self.assertIn("本次认领金额：¥ 100.00", self.followup_jobs(pid)[0]["message"])
+        with closing(app.get_conn()) as conn, conn:
+            ids = [row[0] for row in conn.execute("SELECT id FROM claims WHERE payment_id = ?", (pid,))]
+            app.notify_reminded_payment_claimed(conn, pid, ids, self.actor, 10000)
+        self.assertEqual(len(self.followup_jobs(pid)), 2)
+        other = self.payment()
+        self.seed_overdue_reminder(other)
+        with patch.object(app, "audit", side_effect=RuntimeError("rollback")):
+            with self.assertRaises(RuntimeError):
+                with closing(app.get_conn()) as conn, conn:
+                    app.submit_batch_claims(conn, self.actor, [other], self.department, self.team, self.project)
+        self.assertEqual(self.active(other), 0)
+        self.assertEqual(self.followup_jobs(other), [])
+
     def test_unauthenticated_reads_writes_and_forged_identity_are_blocked(self):
         pid = self.payment()
         for path in ["/me?department=年会&user=u&role=admin", "/search", "/admin", "/admin/export/today", "/admin/export/today-text", "/attachments/test.pdf"]:

@@ -124,3 +124,9 @@ HAVING active_cents < 0 OR active_cents > p.amount_cents;
 ```
 
 通知使用持久化 UUID 降低重试重复风险。飞书的相同 UUID 去重窗口只有 1 小时；发送成功、结果落库前崩溃且超过窗口才恢复，仍可能重复，不承诺跨系统严格恰好一次。[飞书官方 SDK 参数说明](https://larksuite.github.io/oapi-sdk-java/com/lark/oapi/service/im/v1/model/CreateMessageReqBody.Builder.html#uuid(java.lang.String))
+
+### 2026-09-29 后续认领提醒
+
+保留原次日 17 点提醒。已经生成 `payment_reminders` 记录的款项，后续每次成功认领会向该记录中的两个接收人分别入队私信（包括原提醒尚在重试的情况）。普通、批量、分摊均覆盖；多行分摊按每笔款每次提交汇总净额，一人一条，展示本次、累计与剩余金额。
+
+无需新增表、环境变量或依赖，保留现有数据库中的提醒记录及队列。历史已提醒款项在升级后的新认领会触发，升级前已发生的认领不补发；未生成提醒记录的款项不触发。队列事件键前缀为 `reminded_claim:`，发送失败沿用现有重试机制。部署后核对这类事件的两个接收人及 `sent` 状态，并请董芳、何玲确认实际收信。
