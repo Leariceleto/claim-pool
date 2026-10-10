@@ -973,6 +973,7 @@ class ExcelImportTests(unittest.TestCase):
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY,
+                imported_at TEXT DEFAULT '2099-01-01 12:00:00',
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 claimed_department TEXT,
@@ -1095,6 +1096,7 @@ class ExcelImportTests(unittest.TestCase):
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY,
+                imported_at TEXT DEFAULT '2099-01-01 12:00:00',
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 claimed_department TEXT,
@@ -1198,6 +1200,7 @@ class ExcelImportTests(unittest.TestCase):
             """
             CREATE TABLE payments (
                 id INTEGER PRIMARY KEY,
+                imported_at TEXT DEFAULT '2099-01-01 12:00:00',
                 amount_cents INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 claimed_department TEXT,

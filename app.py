@@ -470,6 +470,10 @@ def init_db() -> None:
         ensure_column(conn, "payments", "closed_at", "closed_at TEXT")
         ensure_column(conn, "payments", "receiver_company", "receiver_company TEXT")
         ensure_column(conn, "payments", "reminder_due_at", "reminder_due_at TEXT")
+        conn.execute("""UPDATE notification_outbox
+            SET status = 'cancelled', lease_until = 0, lease_token = NULL,
+                last_error = 'unclaimed_reminder_disabled'
+            WHERE event_key LIKE 'reminder:%' AND status IN ('pending', 'sending')""")
         ensure_column(conn, "notification_outbox", "last_attempt_at", "last_attempt_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_payments_reminder_due ON payments(reminder_due_at)")
         ensure_column(conn, "claims", "team", "team TEXT")
@@ -529,66 +533,23 @@ def stop_reminders() -> None:
     REMINDER_STOP.set()
 
 
-def next_day_reminder_at() -> str:
-    tomorrow = datetime.now(REMINDER_TIMEZONE).date() + timedelta(days=1)
-    return f"{tomorrow.isoformat()} 17:00:00"
-
-
-def process_payment_reminders(current_time: Optional[str] = None) -> None:
-    recipients = list(dict.fromkeys(UNCLAIMED_REMINDER_RECIPIENTS.values()))
-    configured = all(UNCLAIMED_REMINDER_RECIPIENTS.values()) and len(recipients) == 2
-    current_time = current_time or datetime.now(REMINDER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    with closing(get_conn()) as conn, conn:
-        # 串行生成快照，避免多 worker 为同一流水重复创建通知。
-        conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            "SELECT * FROM payments WHERE reminder_due_at <= ?", (current_time,)
-        ).fetchall() if configured else []
-        for payment in rows:
-            if payment["status"] == "draft":
-                continue
-            if payment["status"] in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
-                claimed = claim_totals(conn, payment["id"])["active"]
-                remaining = max(payment["amount_cents"] - claimed, 0)
-                if remaining:
-                    message = "\n".join([
-                        "【到款未认领完提醒】",
-                        f"流水 ID：#{payment['id']}",
-                        f"上传时间：{payment['imported_at']}",
-                        f"付款方：{payment['payer_name'] or '未填写'}",
-                        f"到款公司：{payment['receiver_company'] or '未填写'}",
-                        f"到款总额：¥ {money(payment['amount_cents'])}",
-                        f"已认领金额：¥ {money(claimed)}",
-                        f"剩余未认领金额：¥ {money(remaining)}",
-                        f"统计时间：{current_time}（北京时间）",
-                        "请进入财务到款认领系统查看并跟进。",
-                    ])
-                    conn.execute(
-                        "INSERT OR IGNORE INTO payment_reminders (payment_id, message, recipients_json) VALUES (?, ?, ?)",
-                        (payment["id"], message, json.dumps(recipients)),
-                    )
-            conn.execute("UPDATE payments SET reminder_due_at = NULL WHERE id = ?", (payment["id"],))
-    with closing(get_conn()) as conn:
-        reminders = conn.execute("SELECT payment_id FROM payment_reminders WHERE sent_json != recipients_json").fetchall()
-    for reminder in reminders:
-        with closing(get_conn()) as conn, conn:
-            begin_write(conn)
-            row = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (reminder["payment_id"],)).fetchone()
-            for recipient in json.loads(row["recipients_json"]):
-                if recipient not in json.loads(row["sent_json"]):
-                    enqueue_notification(conn, f"reminder:{row['payment_id']}", recipient, row["message"])
-
-
-def notify_reminded_payment_claimed(conn: sqlite3.Connection, payment_id: int, claim_ids: list[int], actor: dict[str, str], amount_cents: int) -> None:
-    # The persisted overdue reminder marks payments that need follow-up, even if delivery is retrying.
-    reminder = conn.execute("SELECT recipients_json FROM payment_reminders WHERE payment_id = ?", (payment_id,)).fetchone()
-    if not reminder:
-        return
+def notify_late_payment_claimed(conn: sqlite3.Connection, payment_id: int, claim_ids: list[int], actor: dict[str, str], amount_cents: int) -> None:
     payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    current_time = datetime.now(REMINDER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        cutoff = f"{date.fromisoformat(payment['imported_at'][:10]).isoformat()} 17:00:00"
+    except (TypeError, ValueError):
+        logging.warning("到款上传日期无效，跳过认领通知：payment_id=%s", payment_id)
+        return
+    if current_time <= cutoff:
+        return
+    recipients = list(dict.fromkeys(UNCLAIMED_REMINDER_RECIPIENTS.values()))
+    if not all(UNCLAIMED_REMINDER_RECIPIENTS.values()) or len(recipients) != 2:
+        return
     claimed = claim_totals(conn, payment_id)["active"]
     remaining = payment["amount_cents"] - claimed
     message = "\n".join([
-        "【到款后续认领提醒】",
+        "【到款认领提醒】",
         f"流水 ID：#{payment_id}",
         f"付款方：{payment['payer_name'] or '未填写'}",
         f"到款公司：{payment['receiver_company'] or '未填写'}",
@@ -597,11 +558,11 @@ def notify_reminded_payment_claimed(conn: sqlite3.Connection, payment_id: int, c
         f"累计已认领金额：¥ {money(claimed)}",
         f"剩余未认领金额：¥ {money(remaining)}",
         f"当前状态：{'已全部认领' if remaining == 0 else '部分认领'}",
-        f"认领时间：{now_text()}",
+        f"认领时间：{current_time}（北京时间）",
         "请进入财务到款认领系统查看认领明细。",
     ])
     event_key = f"reminded_claim:{payment_id}:{min(claim_ids)}"
-    for recipient in dict.fromkeys(json.loads(reminder["recipients_json"])):
+    for recipient in recipients:
         enqueue_notification(conn, event_key, recipient, message)
 
 
@@ -660,27 +621,16 @@ def process_notification_outbox(current_time: Optional[float] = None, limit: int
         finished = time.time() if current_time is None else current_time
         with closing(get_conn()) as conn, conn:
             begin_write(conn)
-            changed = conn.execute("""UPDATE notification_outbox
+            conn.execute("""UPDATE notification_outbox
                 SET status = ?, sent_at = ?, last_error = ?, available_at = ?, lease_until = 0, lease_token = NULL
                 WHERE id = ? AND lease_token = ?""",
                 ("pending" if error else "sent", None if error else now_text(), error or None,
                  finished + min(3600, 60 * 2 ** min(int(job["attempts"]), 6)) if error else 0,
-                 job["id"], token)).rowcount
-            if changed and not error and job["event_key"].startswith("reminder:"):
-                payment_id = int(job["event_key"].split(":")[1])
-                reminder = conn.execute("SELECT * FROM payment_reminders WHERE payment_id = ?", (payment_id,)).fetchone()
-                if reminder:
-                    sent = set(json.loads(reminder["sent_json"])) | {job["recipient_id"]}
-                    ordered = [item for item in json.loads(reminder["recipients_json"]) if item in sent]
-                    conn.execute("UPDATE payment_reminders SET sent_json = ? WHERE payment_id = ?", (json.dumps(ordered), payment_id))
+                 job["id"], token))
 
 
 def reminder_loop() -> None:
     while not REMINDER_STOP.is_set():
-        try:
-            process_payment_reminders()
-        except Exception:
-            logging.exception("到款未认领提醒任务失败，将在下一轮重试")
         try:
             process_notification_outbox()
         except Exception:
@@ -3014,7 +2964,7 @@ def submit_batch_claims(
             )
         refresh_payment_claim_status(conn, payment_id)
 
-        notify_reminded_payment_claimed(conn, payment_id, [cur.lastrowid], actor, remaining_amount)
+        notify_late_payment_claimed(conn, payment_id, [cur.lastrowid], actor, remaining_amount)
 
     if not created_claim_ids:
         raise HTTPException(status_code=409, detail="选中的到款都无法批量认领，请刷新后重试")
@@ -3177,7 +3127,7 @@ def submit_split_claims(
         created_claim_ids.append(cur.lastrowid)
 
     refresh_payment_claim_status(conn, payment_id)
-    notify_reminded_payment_claimed(conn, payment_id, created_claim_ids, actor, new_total)
+    notify_late_payment_claimed(conn, payment_id, created_claim_ids, actor, new_total)
     payment_after = conn.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
     detail = {
         "payment_id": payment_id,
@@ -3656,7 +3606,7 @@ def submit_claim(
                 ),
             )
             action = "claim_submit"
-        notify_reminded_payment_claimed(conn, payment_id, [claim_cursor.lastrowid], actor, requested_amount)
+        notify_late_payment_claimed(conn, payment_id, [claim_cursor.lastrowid], actor, requested_amount)
         audit(
             conn,
             actor,
@@ -5700,6 +5650,7 @@ def admin_import(
             rows = rows_from_excel(source_path)
     if not rows:
         raise HTTPException(status_code=400, detail="未识别到任何流水。请上传 PDF / Excel 文件。")
+    imported_at = datetime.now(REMINDER_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = conn.execute(
             """
@@ -5707,7 +5658,7 @@ def admin_import(
                 (source_name, created_at, created_by, raw_count, imported_count, skipped_count)
             VALUES (?, ?, ?, ?, 0, 0)
             """,
-            (source_name, now_text(), actor["name"], len(rows)),
+            (source_name, imported_at, actor["name"], len(rows)),
         )
         batch_id = cur.lastrowid
         imported = 0
@@ -5733,12 +5684,12 @@ def admin_import(
                 """
                 INSERT INTO payments
                     (batch_id, imported_at, received_date, received_time, payer_name, amount_cents,
-                     bank_note, receiver_company, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json, reminder_due_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
+                     bank_note, receiver_company, receiver_account, serial_no, source_ref, confidence, status, finance_note, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
                 """,
                 (
                     batch_id,
-                    now_text(),
+                    imported_at,
                     received_date,
                     item.get("received_time", "").strip(),
                     payer_name,
@@ -5751,7 +5702,6 @@ def admin_import(
                     confidence,
                     f"字段缺失：{', '.join(missing)}" if missing else "",
                     json.dumps(item, ensure_ascii=False),
-                    next_day_reminder_at(),
                 ),
             )
             imported += 1

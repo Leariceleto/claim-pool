@@ -9,7 +9,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode, urlsplit
@@ -36,6 +36,10 @@ class ClaimCorrectnessTests(unittest.TestCase):
         network.start()
         self.addCleanup(network.stop)
         app.init_db()
+        clock = patch.object(app, "datetime")
+        self.clock = clock.start()
+        self.clock.now.return_value = datetime(2026, 9, 20, 16, 0, tzinfo=app.REMINDER_TIMEZONE)
+        self.addCleanup(clock.stop)
         self.department = next(iter(app.CATALOG))
         self.team = next(iter(app.CATALOG[self.department]))
         self.project = app.CATALOG[self.department][self.team][0]
@@ -131,10 +135,9 @@ class ClaimCorrectnessTests(unittest.TestCase):
                 self.assertEqual(sorted(results), [303, 409])
                 self.assertEqual(self.active(pid), 10000)
 
-    def seed_overdue_reminder(self, pid):
+    def seed_late_payment(self, pid):
         with closing(app.get_conn()) as conn, conn:
-            conn.execute("INSERT INTO payment_reminders (payment_id, message, recipients_json) VALUES (?, 'Reminder', ?)",
-                         (pid, json.dumps(["d", "h"])))
+            conn.execute("UPDATE payments SET imported_at = '2026-09-19 12:00:00' WHERE id = ?", (pid,))
 
     def followup_jobs(self, pid):
         with closing(app.get_conn()) as conn:
@@ -144,7 +147,7 @@ class ClaimCorrectnessTests(unittest.TestCase):
     def test_reminded_claim_all_entry_points_and_no_unrelated_recipients(self):
         for kind in ["normal", "batch", "split"]:
             pid = self.payment()
-            self.seed_overdue_reminder(pid)
+            self.seed_late_payment(pid)
             self.assertEqual(self.claim_request(kind, pid).status_code, 303)
             jobs = self.followup_jobs(pid)
             self.assertEqual({job["recipient_id"] for job in jobs}, {"d", "h"})
@@ -157,7 +160,7 @@ class ClaimCorrectnessTests(unittest.TestCase):
 
     def test_followup_partial_then_full_and_failed_claim(self):
         pid = self.payment()
-        self.seed_overdue_reminder(pid)
+        self.seed_late_payment(pid)
         self.assertEqual(self.claim_request("normal", pid, "40").status_code, 303)
         jobs = self.followup_jobs(pid)
         self.assertIn("本次认领金额：¥ 40.00", jobs[0]["message"])
@@ -169,7 +172,7 @@ class ClaimCorrectnessTests(unittest.TestCase):
 
     def test_followup_refund_split_deduplicated_and_transactional(self):
         pid = self.payment()
-        self.seed_overdue_reminder(pid)
+        self.seed_late_payment(pid)
         result = self.request("POST", f"/split-claim/{pid}", dict(
             departments=[self.department] * 2, teams=[self.team] * 2,
             projects=[self.project] * 2, amounts=["120", "-20"], notes=["", ""]))
@@ -178,16 +181,76 @@ class ClaimCorrectnessTests(unittest.TestCase):
         self.assertIn("本次认领金额：¥ 100.00", self.followup_jobs(pid)[0]["message"])
         with closing(app.get_conn()) as conn, conn:
             ids = [row[0] for row in conn.execute("SELECT id FROM claims WHERE payment_id = ?", (pid,))]
-            app.notify_reminded_payment_claimed(conn, pid, ids, self.actor, 10000)
+            app.notify_late_payment_claimed(conn, pid, ids, self.actor, 10000)
         self.assertEqual(len(self.followup_jobs(pid)), 2)
         other = self.payment()
-        self.seed_overdue_reminder(other)
+        self.seed_late_payment(other)
         with patch.object(app, "audit", side_effect=RuntimeError("rollback")):
             with self.assertRaises(RuntimeError):
                 with closing(app.get_conn()) as conn, conn:
                     app.submit_batch_claims(conn, self.actor, [other], self.department, self.team, self.project)
         self.assertEqual(self.active(other), 0)
         self.assertEqual(self.followup_jobs(other), [])
+
+    def test_upload_day_cutoff_all_claim_entries_without_reminder_snapshot(self):
+        for kind in ["normal", "batch", "split"]:
+            for hour, minute, second in [(16, 59, 59), (17, 0, 0), (17, 0, 1), (23, 30, 0)]:
+                with self.subTest(kind=kind, time=(hour, minute, second)):
+                    pid = self.payment()
+                    with patch.object(app, "datetime") as clock:
+                        clock.now.return_value = datetime(2026, 9, 20, hour, minute, second, tzinfo=app.REMINDER_TIMEZONE)
+                        self.assertEqual(self.claim_request(kind, pid).status_code, 303)
+                    jobs = self.followup_jobs(pid)
+                    late = (hour, minute, second) > (17, 0, 0)
+                    self.assertEqual(len(jobs), 2 if late else 0)
+                    if late:
+                        self.assertIn("已全部认领", jobs[0]["message"])
+                    self.assertEqual(len(self.followup_jobs(pid)), len(jobs))
+                    with closing(app.get_conn()) as conn:
+                        original = conn.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_key = ?", (f"reminder:{pid}",)).fetchone()[0]
+                    self.assertEqual(original, 0)
+
+    def test_partial_before_cutoff_then_late_claim_without_background_scan(self):
+        pid = self.payment()
+        with patch.object(app, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 9, 20, 16, 59, tzinfo=app.REMINDER_TIMEZONE)
+            self.assertEqual(self.claim_request("normal", pid, "40").status_code, 303)
+            self.assertEqual(self.followup_jobs(pid), [])
+            clock.now.return_value = datetime(2026, 9, 20, 17, 0, 1, tzinfo=app.REMINDER_TIMEZONE)
+            self.assertEqual(self.claim_request("normal", pid, "30").status_code, 303)
+        jobs = self.followup_jobs(pid)
+        self.assertEqual(len(jobs), 2)
+        self.assertIn("本次认领金额：¥ 30.00", jobs[0]["message"])
+        self.assertIn("剩余未认领金额：¥ 30.00", jobs[0]["message"])
+        with patch.object(app, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 9, 22, 10, 0, tzinfo=app.REMINDER_TIMEZONE)
+            self.assertEqual(self.claim_request("split", pid, "30").status_code, 303)
+        self.assertEqual(len(self.followup_jobs(pid)), 4)
+
+    def test_failed_claim_after_cutoff_rolls_back_notification(self):
+        pid = self.payment()
+        with patch.object(app, "audit", side_effect=RuntimeError("rollback")), patch.object(app, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 9, 20, 17, 1, tzinfo=app.REMINDER_TIMEZONE)
+            with self.assertRaises(RuntimeError):
+                with closing(app.get_conn()) as conn, conn:
+                    app.submit_batch_claims(conn, self.actor, [pid], self.department, self.team, self.project)
+        self.assertEqual(self.active(pid), 0)
+        with closing(app.get_conn()) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM payment_reminders").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
+
+    def test_import_records_beijing_date_without_scheduling_unclaimed_notification(self):
+        rows = [dict(received_date="2026-09-20", payer_name="Test payer", amount="100")]
+        with patch.object(app, "datetime") as clock, patch.object(app, "read_table", return_value=rows):
+            clock.now.return_value = datetime(2026, 9, 20, 23, 59, tzinfo=app.REMINDER_TIMEZONE)
+            result = self.request("POST", "/admin/import", dict(source_name="Test import", table_text="Test"))
+        self.assertEqual(result.status_code, 303, result.text)
+        with closing(app.get_conn()) as conn:
+            row = conn.execute("SELECT * FROM payments ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertEqual(row["imported_at"], "2026-09-20 23:59:00")
+            self.assertIsNone(row["reminder_due_at"])
+        app.init_db()
+        self.assertEqual(self.row(row["id"])["imported_at"], "2026-09-20 23:59:00")
 
     def test_unauthenticated_reads_writes_and_forged_identity_are_blocked(self):
         pid = self.payment()
@@ -373,25 +436,21 @@ class ClaimCorrectnessTests(unittest.TestCase):
             self.assertEqual(send.call_args.args[2]["uuid"], job["request_uuid"])
             self.assertEqual(send.call_args.args[0], app.FEISHU_SEND_MSG_URL)
 
-    def test_draft_reminder_survives_due_time_and_legacy_snapshot_migrates(self):
+    def test_upgrade_cancels_old_unclaimed_jobs_but_keeps_other_notifications(self):
         pid = self.payment(status="draft")
         with closing(app.get_conn()) as conn, conn:
             conn.execute("UPDATE payments SET reminder_due_at = '2026-09-21 17:00:00' WHERE id = ?", (pid,))
-        app.process_payment_reminders("2026-09-21 17:00:00")
-        self.assertIsNotNone(self.row(pid)["reminder_due_at"])
-        with closing(app.get_conn()) as conn, conn:
-            conn.execute("UPDATE payments SET status = 'pending' WHERE id = ?", (pid,))
-        app.process_payment_reminders("2026-09-21 18:00:00")
+            app.enqueue_notification(conn, f"reminder:{pid}", "d", "Old unclaimed")
+            app.enqueue_notification(conn, "reminded_claim:1:1", "d", "Keep claim notice")
+            app.enqueue_notification(conn, "reminder:2", "h", "Expired sending lease")
+            app.enqueue_notification(conn, "reminder:3", "h", "Already sent")
+            conn.execute("UPDATE notification_outbox SET status = 'sending' WHERE event_key = 'reminder:2'")
+            conn.execute("UPDATE notification_outbox SET status = 'sent' WHERE event_key = 'reminder:3'")
+        app.init_db()
+        app.init_db()
         with closing(app.get_conn()) as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 2)
-        with closing(app.get_conn()) as conn, conn:
-            conn.execute("DELETE FROM notification_outbox")
-            conn.execute("UPDATE payment_reminders SET sent_json = ?", (json.dumps(["d"]),))
-        with patch.object(app, "UNCLAIMED_REMINDER_RECIPIENTS", {"董芳": "", "何玲": ""}):
-            app.process_payment_reminders("2026-09-21 19:00:00")
-        with closing(app.get_conn()) as conn:
-            jobs = conn.execute("SELECT recipient_id FROM notification_outbox").fetchall()
-            self.assertEqual([r[0] for r in jobs], ["h"])
+            jobs = conn.execute("SELECT status FROM notification_outbox ORDER BY id").fetchall()
+            self.assertEqual([r[0] for r in jobs], ["cancelled", "pending", "cancelled", "sent"])
 
     def test_migration_is_repeatable_and_does_not_crash_on_legacy_overclaim(self):
         pid = self.payment(claims=[12000])
