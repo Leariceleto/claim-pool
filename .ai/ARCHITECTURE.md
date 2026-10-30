@@ -65,6 +65,8 @@ FastAPI (app.py, uvicorn)
 | POST `/claim/{payment_id}` | 登录 | 提交普通认领 |
 | POST `/claim/batch` | 登录 | 批量认领搜索页勾选的多笔到款 |
 | GET `/split-claim` | 登录 | 分摊认领搜索与填写页面 |
+| GET `/split-claim/import-template` | 登录 | 下载空白分摊表模板 |
+| POST `/split-claim/{payment_id}/import-preview` | 登录 | 识别分摊表及匹配项目，仅返回预览 |
 | POST `/split-claim/{payment_id}` | 登录 | 提交一笔到款的多行分摊认领 |
 | GET `/me` | 登录 | 个人中心、数据看板、我的认领 |
 | POST `/me/profile` | 登录 | 设置本人部门/中心 |

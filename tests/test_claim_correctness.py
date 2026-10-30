@@ -49,12 +49,13 @@ class ClaimCorrectnessTests(unittest.TestCase):
             conn.execute("INSERT INTO user_profiles (open_id, name, department, team, updated_at) VALUES ('u', 'User', ?, ?, '2026-09-20')", (self.department, self.team))
         self.cookie = {app.SESSION_COOKIE: app.make_session({"id": "u", "name": "User"})}
 
-    def request(self, method, path, data=None, authenticated=True, extra_headers=()):
+    def request(self, method, path, data=None, authenticated=True, extra_headers=(), raw_body=None,
+                content_type="application/x-www-form-urlencoded"):
         # 直接走真实 ASGI 中间件和路由，不引入 HTTP 客户端依赖，也不启动通知线程。
         async def run():
             target = urlsplit(path)
-            body = urlencode(data or {}, doseq=True).encode()
-            headers = [(b"content-type", b"application/x-www-form-urlencoded")]
+            body = raw_body if raw_body is not None else urlencode(data or {}, doseq=True).encode()
+            headers = [(b"content-type", content_type.encode())]
             headers.extend(extra_headers)
             if authenticated:
                 headers.append((b"cookie", "; ".join(f"{k}={v}" for k, v in self.cookie.items()).encode()))

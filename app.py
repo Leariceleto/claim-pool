@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import unicodedata
 import zipfile
 from contextlib import closing
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -1406,6 +1407,15 @@ BASE_CSS = """
       .admin-stat-grid { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
       .catalog-panel .row > form, .catalog-panel form.row > div { min-width:0 !important; max-width:100%; flex:1 1 100% !important; }
       table { min-width:680px; }
+      .split-results > table, .split-results > table > tbody,
+      .split-results > table > tbody > tr { display:block; min-width:0; width:100%; }
+      .split-results > table > thead { display:none; }
+      .split-results > table > tbody > tr > td { display:block; min-width:0; width:auto; text-align:left; }
+      .split-results > table > tbody > tr > td:not(.split-form-cell) { padding:6px 12px; }
+      .split-results .split-form-cell { padding:8px; }
+      .split-results .split-form-cell details.fold .fold-body { padding:10px; }
+      .split-results .split-form-table { width:100%; overflow-x:auto; }
+      .split-results .callout { padding:12px; overflow-wrap:anywhere; }
       .dash-table-wrap { overflow-x:hidden; }
       .dash-table { display:block; min-width:0; }
       .dash-table colgroup, .dash-table thead { display:none; }
@@ -2158,10 +2168,10 @@ FORM_INTERACTION_JS = """
     var target = new URL(form.getAttribute('action') || location.href, location.href);
     if (target.origin !== location.origin) return;
     event.preventDefault();
-    if (form.dataset.submitting) return;
+    if (form.dataset.submitting || form.dataset.importing) return;
     var data = new FormData(form);
     if (event.submitter && event.submitter.name) data.append(event.submitter.name, event.submitter.value);
-    var body = form.enctype === 'multipart/form-data' || form.querySelector('input[type=file]') ? data : new URLSearchParams(data);
+    var body = form.enctype === 'multipart/form-data' || form.querySelector('input[type=file][name]') ? data : new URLSearchParams(data);
     var controls = Array.prototype.map.call(form.elements, function (element) {
       return {element:element, disabled:element.disabled};
     });
@@ -2179,7 +2189,7 @@ FORM_INTERACTION_JS = """
     }
     feedback.className = 'form-feedback pending';
     feedback.setAttribute('role', 'status');
-    feedback.textContent = form.querySelector('input[type=file]') ? '正在上传并处理，请稍候…' : '正在提交，请稍候…';
+    feedback.textContent = form.querySelector('input[type=file][name]') ? '正在上传并处理，请稍候…' : '正在提交，请稍候…';
     function unlock() {
       controls.forEach(function (item) { item.element.disabled = item.disabled; });
       delete form.dataset.submitting;
@@ -2246,6 +2256,13 @@ FORM_INTERACTION_JS = """
       cents += amount;
     });
     total.textContent = valid && Number.isSafeInteger(cents) ? '本次分摊净额：¥ ' + (cents / 100).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}) : '本次分摊净额：请检查金额格式';
+    if (form.dataset.remainingCents !== undefined && valid) {
+      var remaining = Number(form.dataset.remainingCents);
+      total.textContent += '；剩余可认领：¥ ' + (remaining / 100).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2});
+      if (cents > remaining) total.textContent += '（超出可认领金额，请调整）';
+      else if (cents > 0 && cents < remaining) total.textContent += '（本次为部分认领）';
+      else if (cents < 0) total.textContent += '（净额须大于 0）';
+    }
   }
   document.addEventListener('input', function (event) {
     if (event.target.name === 'amounts' && event.target.form) updateSplitTotal(event.target.form);
@@ -2442,6 +2459,7 @@ function addSplitClaimRow(button) {
   tbody.appendChild(row);
   enableTouchProjectPicker(project.input);
   refreshSplitRowNumbers(tbody);
+  return row;
 }
 document.addEventListener('click', function (e) {
   var button = e.target.closest('.split-add-row');
@@ -2449,6 +2467,93 @@ document.addEventListener('click', function (e) {
   addSplitClaimRow(button);
 });
 document.querySelectorAll('input.cs-project').forEach(enableTouchProjectPicker);
+
+document.addEventListener('click', async function (event) {
+  var button = event.target.closest('.split-import-button');
+  if (!button) return;
+  var form = button.closest('form');
+  if (form.dataset.importing || form.dataset.submitting) return;
+  var fileInput = form.querySelector('.split-import-file');
+  var status = form.querySelector('.split-import-status');
+  status.setAttribute('role', 'status');
+  if (!fileInput.files.length) { status.textContent = '请先选择表格文件。'; return; }
+  var file = fileInput.files[0];
+  if (file.size > 5 * 1024 * 1024) { status.textContent = '文件不能超过 5 MB。'; return; }
+  var body = new FormData();
+  body.append('attachment', file);
+  var controls = Array.prototype.map.call(form.elements, function (element) { return {element:element, disabled:element.disabled}; });
+  controls.forEach(function (item) { item.element.disabled = true; });
+  form.dataset.importing = '1';
+  status.textContent = '正在识别表格…';
+  try {
+    var response = await fetch(form.getAttribute('action') + '/import-preview', {
+      method:'POST', body:body, credentials:'same-origin', headers:{'X-Requested-With':'fetch', 'Accept':'application/json'}
+    });
+    var result = await response.json();
+    if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '识别失败，请检查文件格式。');
+    var tbody = form.querySelector('.split-form-table tbody');
+    if (Array.prototype.some.call(tbody.rows, function (row) { return row.dataset.importFingerprint === result.fingerprint; })) {
+      throw new Error('这份文件已经填入当前明细，请勿重复导入。需要重导时请先移除该文件的全部导入行。');
+    }
+    // 仅移除完全空白的占位行，保护所有手工填写内容。
+    Array.prototype.slice.call(tbody.rows).forEach(function (row) {
+      if (!Array.prototype.some.call(row.querySelectorAll('[name]'), function (field) { return field.value.trim(); })) row.remove();
+    });
+    result.lines.forEach(function (line) {
+      var row = addSplitClaimRow(button);
+      row.dataset.importFingerprint = result.fingerprint;
+      var dept = row.querySelector('.cs-dept'), team = row.querySelector('.cs-team'), project = row.querySelector('.cs-project');
+      dept.required = team.required = project.required = true;
+      dept.value = line.department;
+      dept.dispatchEvent(new Event('change', {bubbles:true}));
+      team.value = line.team;
+      team.dispatchEvent(new Event('change', {bubbles:true}));
+      project.value = line.project;
+      row.querySelector('[name=amounts]').value = line.amount;
+      row.querySelector('[name=amounts]').required = true;
+      row.querySelector('[name=notes]').value = line.note;
+      var source = document.createElement('div');
+      source.className = 'hint';
+      source.textContent = line.source + '：' + [line.source_department, line.source_team, line.source_project].filter(Boolean).join(' / ');
+      project.parentElement.appendChild(source);
+      if (line.issue) {
+        var issue = document.createElement('div');
+        issue.className = 'split-import-issue';
+        issue.style.color = '#9a3412';
+        issue.textContent = line.issue;
+        project.parentElement.appendChild(issue);
+      }
+      var remove = document.createElement('button');
+      remove.type = 'button'; remove.className = 'secondary'; remove.textContent = '移除此行';
+      remove.style.marginTop = '8px';
+      remove.addEventListener('click', function () {
+        row.remove(); refreshSplitRowNumbers(tbody);
+        var amount = form.querySelector('[name=amounts]');
+        if (!amount) { addSplitClaimRow(button); amount = form.querySelector('[name=amounts]'); }
+        amount.dispatchEvent(new Event('input', {bubbles:true}));
+      });
+      row.lastElementChild.appendChild(remove);
+    });
+    form.dataset.remainingCents = result.remaining_cents;
+    form.querySelector('[name=amounts]').dispatchEvent(new Event('input', {bubbles:true}));
+    status.textContent = '已追加 ' + result.lines.length + ' 行，导入净额 ¥ ' + (result.total_cents / 100).toFixed(2) + '；其中 ' + result.unmatched + ' 行需手动选择归属。' +
+      (result.skipped_totals ? '已跳过 ' + result.skipped_totals + ' 行合计/小计，请核对。' : '') + '尚未提交认领，请检查下方明细。';
+    fileInput.value = '';
+  } catch (error) {
+    status.setAttribute('role', 'alert');
+    status.textContent = error.message || '识别失败，请重试。';
+  } finally {
+    controls.forEach(function (item) { item.element.disabled = item.disabled; });
+    delete form.dataset.importing;
+  }
+});
+document.addEventListener('change', function (event) {
+  var row = event.target.closest('tr[data-import-fingerprint]');
+  if (!row) return;
+  var issue = row.querySelector('.split-import-issue');
+  if (issue) issue.textContent = row.querySelector('.cs-dept').value && row.querySelector('.cs-team').value &&
+    row.querySelector('.cs-project').value && projectInputHasKnownValue(row.querySelector('.cs-project')) ? '已手动选择，请核对' : '请补全项目归属';
+});
 """
 
 BULK_ADMIN_JS = """
@@ -2983,6 +3088,186 @@ def submit_batch_claims(
     return detail
 
 
+SPLIT_IMPORT_MAX_ROWS = 2000
+SPLIT_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+SPLIT_IMPORT_HEADERS = {
+    "department": {"部门", "事业部", "所属部门"},
+    "team": {"中心", "小组", "中心/小组", "所属中心"},
+    "project": {"项目", "项目名称", "产品", "产品名称", "商品名称"},
+    "amount": {"分摊金额", "金额", "认领金额", "净额"},
+    "note": {"备注", "说明"},
+}
+
+
+def split_import_key(value: Any) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", excel_value_text(value)))
+
+
+def split_import_header(value: Any) -> str:
+    key = re.sub(r"[（(]元[）)]$", "", split_import_key(value))
+    return next((field for field, names in SPLIT_IMPORT_HEADERS.items() if key in names), "")
+
+
+def split_import_matrix(matrix: list[list[Any]], sheet: str) -> tuple[list[dict[str, Any]], int]:
+    if not any(any(excel_value_text(cell) for cell in row) for row in matrix):
+        return [], 0
+    headers, start = [], -1
+    for index, row in enumerate(matrix[:20]):
+        candidate = [split_import_header(cell) for cell in row]
+        if {"project", "amount"}.issubset(candidate):
+            for field in SPLIT_IMPORT_HEADERS:
+                if candidate.count(field) > 1:
+                    label = {"department": "部门", "team": "中心/小组", "project": "产品/项目", "amount": "金额", "note": "备注"}[field]
+                    raise HTTPException(400, f"{sheet}：存在多个“{label}”列，请只保留一列，明确分摊金额口径")
+            headers, start = candidate, index
+            break
+    if start < 0:
+        raise HTTPException(400, f"{sheet}：未找到表头，请包含“产品名称（或项目）”和“分摊金额（或金额）”列；平台订单请先整理为分摊净额")
+    catalog = [(d, t, p) for d, teams in CATALOG.items() for t, projects in teams.items() for p in projects]
+    result, skipped = [], 0
+    for number, row in enumerate(matrix[start + 1:], start + 2):
+        if not any(excel_value_text(cell) for cell in row):
+            continue
+        item = {field: excel_value_text(row[i]) if i < len(row) else "" for i, field in enumerate(headers) if field}
+        label = f"{sheet} 第 {number} 行"
+        if split_import_key(item.get("project", "")) in {"合计", "总计", "小计"}:
+            skipped += 1
+            continue
+        if not item.get("project") or not item.get("amount"):
+            raise HTTPException(400, f"{label}：产品/项目名称和分摊金额不能为空")
+        if any(value.startswith("=") for value in item.values()):
+            raise HTTPException(400, f"{label}：请将公式复制并粘贴为数值后导入，避免读取未计算的金额")
+        try:
+            cents = parse_form_amount(item["amount"])
+        except HTTPException as exc:
+            raise HTTPException(400, f"{label}：{exc.detail}") from exc
+        if cents == 0:
+            raise HTTPException(400, f"{label}：分摊金额不能为 0，请删除不需认领的行")
+        if abs(cents) > 9007199254740991:
+            raise HTTPException(400, f"{label}：金额过大，无法准确预览")
+        matches = [(d, t, p) for d, t, p in catalog
+                   if split_import_key(p) == split_import_key(item["project"])
+                   and (not item.get("department") or split_import_key(d) == split_import_key(item["department"]))
+                   and (not item.get("team") or split_import_key(t) == split_import_key(item["team"]))]
+        match = matches[0] if len(matches) == 1 else ("", "", "")
+        result.append(dict(department=match[0], team=match[1], project=match[2],
+                           amount=f"{Decimal(cents) / 100:.2f}", amount_cents=cents,
+                           note=item.get("note", ""), source=label, source_project=item["project"],
+                           source_department=item.get("department", ""), source_team=item.get("team", ""),
+                           issue="" if len(matches) == 1 else ("项目重名，请选择归属" if matches else "未匹配到现有项目，请选择归属")))
+    return result, skipped
+
+
+def parse_split_import(content: bytes, filename: str) -> dict[str, Any]:
+    """只识别并预览，不写认领、附件或通知；不推算平台退款及手续费。"""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".xlsx", ".xls", ".csv"}:
+        raise HTTPException(400, "请上传 .xlsx、.xls 或 .csv 表格")
+    if not content or len(content) > SPLIT_IMPORT_MAX_BYTES:
+        raise HTTPException(400, "文件不能为空且不能超过 5 MB")
+    matrices = []
+    max_sheet_rows = SPLIT_IMPORT_MAX_ROWS + 20
+    try:
+        if suffix == ".csv":
+            try:
+                text = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = content.decode("gb18030")
+            rows = []
+            for row in csv.reader(io.StringIO(text)):
+                if len(rows) >= max_sheet_rows or len(row) > 50:
+                    raise HTTPException(400, "表格过大，每张表最多 2020 行、50 列")
+                rows.append(row)
+            matrices.append(("CSV", rows))
+        elif zipfile.is_zipfile(io.BytesIO(content)):
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                if sum(item.file_size for item in archive.infolist()) > 50 * 1024 * 1024:
+                    raise HTTPException(400, "Excel 解压后过大，请拆分表格")
+            from openpyxl import load_workbook
+            workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=False)
+            try:
+                if len(workbook.worksheets) > 20:
+                    raise HTTPException(400, "最多支持 20 个工作表")
+                for sheet in workbook.worksheets:
+                    rows = []
+                    if (sheet.max_row or 0) > max_sheet_rows or (sheet.max_column or 0) > 50:
+                        raise HTTPException(400, f"{sheet.title}：表格过大，请删除多余空行空列，最多 2020 行、50 列")
+                    for row in sheet.iter_rows(values_only=True):
+                        if len(rows) >= max_sheet_rows or len(row) > 50:
+                            raise HTTPException(400, "表格过大，请拆分导入")
+                        rows.append(list(row))
+                    matrices.append((sheet.title, rows))
+            finally:
+                workbook.close()
+        elif suffix == ".xls":
+            import xlrd
+            workbook = xlrd.open_workbook(file_contents=content, on_demand=True)
+            try:
+                if workbook.nsheets > 20:
+                    raise HTTPException(400, "最多支持 20 个工作表")
+                for sheet in workbook.sheets():
+                    if sheet.nrows > max_sheet_rows or sheet.ncols > 50:
+                        raise HTTPException(400, f"{sheet.name}：表格过大，最多 2020 行、50 列")
+                    matrices.append((sheet.name, [sheet.row_values(i) for i in range(sheet.nrows)]))
+            finally:
+                workbook.release_resources()
+        else:
+            raise HTTPException(400, "无法读取 Excel，请确认文件未损坏且未加密")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "无法读取表格，请确认文件未损坏、未加密，或另存为 Excel/CSV 后重试") from exc
+    lines, skipped = [], 0
+    for sheet, matrix in matrices:
+        parsed, subtotal_rows = split_import_matrix(matrix, sheet)
+        lines.extend(parsed)
+        skipped += subtotal_rows
+    if not lines or len(lines) > SPLIT_IMPORT_MAX_ROWS:
+        raise HTTPException(400, "请提供 1 至 2000 条分摊明细")
+    total = sum(line["amount_cents"] for line in lines)
+    if sum(abs(line["amount_cents"]) for line in lines) > 9007199254740991:
+        raise HTTPException(400, "金额合计过大，无法准确预览")
+    return dict(lines=lines, total_cents=total, skipped_totals=skipped, fingerprint=hashlib.sha256(content).hexdigest(),
+                unmatched=sum(bool(line["issue"]) for line in lines))
+
+
+@app.get("/split-claim/import-template")
+def split_import_template(request: Request) -> Response:
+    if not actor_from_request(request).get("authed"):
+        raise HTTPException(403, "请先用飞书登录")
+    from openpyxl import Workbook
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "分摊明细"
+    sheet.append(["部门", "中心/小组", "产品名称", "分摊金额", "备注"])
+    for col in "ABCDE":
+        sheet.column_dimensions[col].width = 24
+    sheet.freeze_panes = "A2"
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return Response(output.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="split-claim-template.xlsx"'})
+
+
+@app.post("/split-claim/{payment_id}/import-preview")
+def preview_split_import(request: Request, payment_id: int, attachment: UploadFile = File(...)) -> dict[str, Any]:
+    if not actor_from_request(request).get("authed"):
+        raise HTTPException(403, "请先用飞书登录")
+    with closing(get_conn()) as conn:
+        payment = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not payment:
+            raise HTTPException(404, "到款记录不存在")
+        if payment["status"] not in {"pending", "partial_claiming", "claimed", "pending_confirm"}:
+            raise HTTPException(409, "这笔款当前状态不能分摊认领")
+        totals = claim_totals(conn, payment_id)
+        validate_claim_net(payment["amount_cents"], totals["active"])
+        remaining = payment["amount_cents"] - totals["active"]
+    result = parse_split_import(attachment.file.read(SPLIT_IMPORT_MAX_BYTES + 1), attachment.filename or "")
+    result["remaining_cents"] = remaining
+    return result
+
+
 def split_claim_line_rows(count: int = 6) -> str:
     rows = []
     for index in range(count):
@@ -3001,15 +3286,25 @@ def split_claim_line_rows(count: int = 6) -> str:
     return "".join(rows)
 
 
-def split_claim_form_html(row: sqlite3.Row) -> str:
+def split_claim_form_html(row: sqlite3.Row, remaining_cents: Optional[int] = None) -> str:
+    remaining = row["amount_cents"] if remaining_cents is None else remaining_cents
     return f"""
     <details class="fold">
       <summary>填写分摊明细</summary>
       <div class="fold-body">
-        <form method="post" action="/split-claim/{row['id']}">
+        <form method="post" action="/split-claim/{row['id']}" data-remaining-cents="{remaining}">
           <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); margin-bottom:14px">
             <div class="stat" style="--dot:#2456d6"><span class="stat-label">到款金额</span><strong>¥ {money(row["amount_cents"])}</strong></div>
             <div class="stat" style="--dot:#16a34a"><span class="stat-label">当前状态</span><strong style="font-size:18px">{status_badge(row["status"])}</strong></div>
+          </div>
+          <div class="callout info">
+            <strong>从表格填入分摊明细</strong>
+            <p class="hint">必填：产品名称、分摊金额（元）；选填：部门、中心/小组、备注。名称唯一匹配时自动填入归属，未匹配或重名的项目请手动选择。退款可另列负数，已计入净额的退款不要重复扣除。</p>
+            <label>选择分摊表（Excel / CSV，最多 5 MB、2000 条）<input type="file" class="split-import-file" accept=".xlsx,.xls,.csv"></label>
+            <button type="button" class="secondary split-import-button">识别并填入明细</button>
+            <a href="/split-claim/import-template" style="margin-left:12px">下载空白模板</a>
+            <p class="hint">只填入页面，核对后再提交认领；已有填写内容保留，新明细追加。平台原始订单请先整理分摊净额，不自动扣退款或手续费。</p>
+            <div class="split-import-status" role="status" aria-live="polite"></div>
           </div>
           <div class="table-wrap split-form-table" style="box-shadow:none; margin-bottom:12px">
             <table>
@@ -3371,12 +3666,12 @@ def split_claim_page(request: Request, q: str = "") -> HTMLResponse:
                       <td>{status_badge(row["status"])}{claim_summary_html(conn, row)}</td>
                     </tr>
                     <tr>
-                      <td colspan="5" class="split-form-cell">{split_claim_form_html(row)}</td>
+                      <td colspan="5" class="split-form-cell">{split_claim_form_html(row, row['amount_cents'] - claim_totals(conn, row['id'])['active'])}</td>
                     </tr>
                     """
                 )
         result_html = f"""
-        <div class="table-wrap">
+        <div class="table-wrap split-results">
         <table>
           <thead><tr><th>到款</th><th>金额</th><th>到款公司</th><th>付款方 / 备注</th><th>状态</th></tr></thead>
           <tbody>{''.join(table_rows)}</tbody>
