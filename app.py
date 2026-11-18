@@ -551,7 +551,7 @@ def notify_late_payment_claimed(conn: sqlite3.Connection, payment_id: int, claim
     remaining = payment["amount_cents"] - claimed
     message = "\n".join([
         "【到款认领提醒】",
-        f"流水 ID：#{payment_id}",
+        f"流水 ID：#{payment_id}    到款日期：{payment['received_date'] or '未填写'}",
         f"付款方：{payment['payer_name'] or '未填写'}",
         f"到款公司：{payment['receiver_company'] or '未填写'}",
         f"认领人：{actor['name']}",

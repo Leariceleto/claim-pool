@@ -27,7 +27,7 @@ class PaymentReminderTests(unittest.TestCase):
     def payment(self, claimed=10000, imported_at="2026-09-16 12:00:00"):
         with self.app.get_conn() as conn:
             pid = conn.execute(
-                "INSERT INTO payments (imported_at, payer_name, amount_cents, status) VALUES (?, '测试付款方', 10000, 'claimed')",
+                "INSERT INTO payments (imported_at, received_date, payer_name, amount_cents, status) VALUES (?, '2026-09-15', '测试付款方', 10000, 'claimed')",
                 (imported_at,),
             ).lastrowid
             cid = conn.execute(
@@ -56,6 +56,7 @@ class PaymentReminderTests(unittest.TestCase):
         self.assertEqual(send.call_count, 2)
         self.assertEqual({call.args[0]["recipient_id"] for call in send.call_args_list}, {"ou_d", "ou_h"})
         message = send.call_args.args[0]["message"]
+        self.assertEqual(message.splitlines()[1], f"流水 ID：#{pid}    到款日期：2026-09-15")
         self.assertIn("本次认领金额：¥ 30.00", message)
         self.assertIn("剩余未认领金额：¥ 70.00", message)
 
